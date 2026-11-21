@@ -19,7 +19,7 @@
 mod parse;
 
 use ahash::{AHashMap, RandomState};
-use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use memchr::memchr;
@@ -49,6 +49,25 @@ impl<T> SyncPtr<T> {
     fn get(&self) -> *mut T {
         self.0
     }
+}
+
+/// Join per-task vectors into one, copying the parts in parallel into a pre-sized buffer.
+fn par_concat<T: Copy + Send + Sync>(parts: Vec<Vec<T>>) -> Vec<T> {
+    let mut offsets = Vec::with_capacity(parts.len() + 1);
+    let mut total = 0usize;
+    for p in &parts {
+        offsets.push(total);
+        total += p.len();
+    }
+    let mut out: Vec<T> = Vec::with_capacity(total);
+    let dst = SyncPtr(out.as_mut_ptr());
+    parts.par_iter().zip(offsets.par_iter()).for_each(|(p, &off)| {
+        // SAFETY: each part writes its own disjoint range [off, off + len) inside the allocation.
+        unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), dst.get().add(off), p.len()) };
+    });
+    // SAFETY: every element in 0..total was written above.
+    unsafe { out.set_len(total) };
+    out
 }
 
 struct Timer(Instant);
@@ -252,12 +271,7 @@ fn parse_events(products: &Products, rs: &RandomState, tasks: &[(Bytes, usize, u
             out
         })
         .collect();
-    let total: usize = parts.iter().map(Vec::len).sum();
-    let mut rows = Vec::with_capacity(total);
-    for p in parts {
-        rows.extend(p);
-    }
-    rows
+    par_concat(parts)
 }
 
 #[derive(Clone, Copy)]
@@ -292,7 +306,7 @@ fn parse_clicks(campaigns: &Campaigns, ws: i64, we: i64, tasks: &[(Bytes, usize,
             out
         })
         .collect();
-    parts.concat()
+    par_concat(parts)
 }
 
 fn parse_links(tasks: &[(Bytes, usize, usize, bool)]) -> Vec<(Bytes, Bytes)> {
@@ -311,7 +325,7 @@ fn parse_links(tasks: &[(Bytes, usize, usize, bool)]) -> Vec<(Bytes, Bytes)> {
             out
         })
         .collect();
-    parts.concat()
+    par_concat(parts)
 }
 
 // ----------------------------------------------------------------- stage 2: events dedup
@@ -386,7 +400,7 @@ fn dedup_and_validate(rows: &[EvRow], ws: i64, we: i64) -> Vec<u32> {
                 .collect()
         })
         .collect();
-    per_shard.concat()
+    par_concat(per_shard)
 }
 
 #[inline]
@@ -635,13 +649,13 @@ struct Names {
 }
 
 impl Names {
-    fn name(&self, person: u32) -> String {
-        String::from_utf8(self.keys[self.best[person as usize] as usize].to_vec()).expect("user id is UTF-8")
+    fn bytes(&self, person: u32) -> Bytes {
+        self.keys[self.best[person as usize] as usize]
     }
 }
 
 struct ChunkOut {
-    users: Vec<(String, UserRow)>,
+    users: Vec<UserRow>,
     credited: Vec<[i64; 3]>, // (campaign, day) -> sessions, purchasing, revenue; campaign = ncamp is organic
     assisted: Vec<i64>,      // (campaign, day)
 }
@@ -657,10 +671,10 @@ struct Dims {
 fn process_chunk(dims: &Dims, names: &Names, evs: &[EvS], cls: &[ClS]) -> ChunkOut {
     // ---- sessions and per-(person, day) user accumulators
     let mut sessions: Vec<Sess> = Vec::new();
-    let mut users: Vec<(String, UserRow)> = Vec::new();
+    let mut users: Vec<UserRow> = Vec::new();
     let mut acc: Option<(u32, u32, UserRow, Vec<i64>, bool)> = None; // (person, day, row, cat sums, has purchase)
 
-    let flush = |acc: &mut Option<(u32, u32, UserRow, Vec<i64>, bool)>, users: &mut Vec<(String, UserRow)>| {
+    let flush = |acc: &mut Option<(u32, u32, UserRow, Vec<i64>, bool)>, users: &mut Vec<UserRow>| {
         if let Some((_, _, mut row, cats, purch)) = acc.take() {
             row.top = -1;
             if purch {
@@ -672,7 +686,7 @@ fn process_chunk(dims: &Dims, names: &Names, evs: &[EvS], cls: &[ClS]) -> ChunkO
                     }
                 }
             }
-            users.push((names.name(row.person), row));
+            users.push(row);
         }
     };
 
@@ -805,53 +819,74 @@ fn count_island(dims: &Dims, sp: &[Sess], assisted: &mut [i64], camp: usize, lo:
 
 // ----------------------------------------------------------------- stage 5: write
 
-fn write_tables(
-    out: &Path,
-    cat_names: &[String],
-    user_rows: Vec<(String, u32, i64, i64, i64, i32)>,
-    campaigns: &Campaigns,
-    dims: &Dims,
-    credited: &[[i64; 3]],
-    assisted: &[i64],
-) -> Result<(), Box<dyn std::error::Error>> {
-    // user_daily
-    let n = user_rows.len();
-    let mut uid = Vec::with_capacity(n);
-    let mut day = Vec::with_capacity(n);
-    let mut sess = Vec::with_capacity(n);
-    let mut ev = Vec::with_capacity(n);
-    let mut rev = Vec::with_capacity(n);
-    let mut top: Vec<Option<String>> = Vec::with_capacity(n);
-    for (name, d, s, e, r, t) in &user_rows {
-        uid.push(name.as_str());
-        day.push((dims.wsday + *d as i64) as i32);
-        sess.push(*s);
-        ev.push(*e);
-        rev.push(*r);
-        top.push(if *t < 0 { None } else { Some(cat_names[*t as usize].clone()) });
-    }
-    let top_refs: Vec<Option<&str>> = top.iter().map(|o| o.as_deref()).collect();
-    let schema = Arc::new(Schema::new(vec![
+fn user_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
         Field::new("sessions", DataType::Int64, false),
         Field::new("events", DataType::Int64, false),
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("top_category", DataType::Utf8, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(uid)) as ArrayRef,
-            Arc::new(Date32Array::from(day)),
-            Arc::new(Int64Array::from(sess)),
-            Arc::new(Int64Array::from(ev)),
-            Arc::new(Int64Array::from(rev)),
-            Arc::new(StringArray::from(top_refs)),
-        ],
-    )?;
-    write_parquet(&out.join("user_daily").join("part-0.parquet"), schema, batch)?;
+    ]))
+}
 
+/// Write user_daily as several Parquet files at once; each worker builds its own Arrow arrays.
+fn write_users(
+    out: &Path,
+    cat_names: &[String],
+    names: &Names,
+    rows: &[UserRow],
+    dims: &Dims,
+    nfiles: usize,
+) -> Result<(), String> {
+    let schema = user_schema();
+    let nfiles = nfiles.max(1);
+    let per = rows.len().div_ceil(nfiles).max(1);
+    (0..nfiles).into_par_iter().try_for_each(|f| -> Result<(), String> {
+        let lo = (f * per).min(rows.len());
+        let hi = ((f + 1) * per).min(rows.len());
+        if f > 0 && lo == hi {
+            return Ok(());
+        }
+        let part = &rows[lo..hi];
+        let mut uid = StringBuilder::with_capacity(part.len(), part.len() * 12);
+        let mut top = StringBuilder::with_capacity(part.len(), part.len() * 6);
+        let mut day = Vec::with_capacity(part.len());
+        let mut sess = Vec::with_capacity(part.len());
+        let mut ev = Vec::with_capacity(part.len());
+        let mut rev = Vec::with_capacity(part.len());
+        for r in part {
+            uid.append_value(std::str::from_utf8(names.bytes(r.person)).expect("user id is UTF-8"));
+            top.append_option(if r.top < 0 { None } else { Some(cat_names[r.top as usize].as_str()) });
+            day.push((dims.wsday + r.day as i64) as i32);
+            sess.push(r.sessions);
+            ev.push(r.events);
+            rev.push(r.revenue);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(uid.finish()) as ArrayRef,
+                Arc::new(Date32Array::from(day)),
+                Arc::new(Int64Array::from(sess)),
+                Arc::new(Int64Array::from(ev)),
+                Arc::new(Int64Array::from(rev)),
+                Arc::new(top.finish()),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        write_parquet(&out.join("user_daily").join(format!("part-{f}.parquet")), schema.clone(), batch)
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn write_tables(
+    out: &Path,
+    campaigns: &Campaigns,
+    dims: &Dims,
+    credited: &[[i64; 3]],
+    assisted: &[i64],
+) -> Result<(), Box<dyn std::error::Error>> {
     // campaign_daily
     let mut cid = Vec::new();
     let mut chan = Vec::new();
@@ -909,7 +944,12 @@ fn write_parquet(
     batch: RecordBatch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(path)?;
-    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)?;
+    // Dictionary encoding and statistics cost time here and nothing reads them; row order and file count are free.
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .build();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(())
@@ -948,12 +988,12 @@ fn main() {
     ));
 
     let rs = RandomState::new();
-    let rows = parse_events(&products, &rs, &ev_tasks);
-    timer.log(&format!("parsed {} event lines", rows.len()));
-    let clicks = parse_clicks(&campaigns, ws, we, &ck_tasks);
-    timer.log(&format!("parsed {} valid clicks", clicks.len()));
-    let links = parse_links(&ln_tasks);
-    timer.log(&format!("parsed {} valid links", links.len()));
+    // The three inputs are independent: parse them concurrently on the shared pool.
+    let (rows, (clicks, links)) = rayon::join(
+        || parse_events(&products, &rs, &ev_tasks),
+        || rayon::join(|| parse_clicks(&campaigns, ws, we, &ck_tasks), || parse_links(&ln_tasks)),
+    );
+    timer.log(&format!("parsed {} event lines, {} valid clicks, {} valid links", rows.len(), clicks.len(), links.len()));
 
     let kept = dedup_and_validate(&rows, ws, we);
     timer.log(&format!("events deduped and validated: {} kept", kept.len()));
@@ -1074,7 +1114,7 @@ fn main() {
     // ---- merge
     let mut credited = vec![[0i64; 3]; (dims.ncamp + 1) * nd];
     let mut assisted = vec![0i64; (dims.ncamp + 1) * nd];
-    let mut user_rows: Vec<(String, u32, i64, i64, i64, i32)> = Vec::new();
+    let mut user_rows: Vec<UserRow> = Vec::with_capacity(outs.iter().map(|o| o.users.len()).sum());
     for out in &outs {
         for (dst, src) in credited.iter_mut().zip(&out.credited) {
             for k in 0..3 {
@@ -1084,23 +1124,19 @@ fn main() {
         for (dst, src) in assisted.iter_mut().zip(&out.assisted) {
             *dst += src;
         }
-        for (name, u) in &out.users {
-            user_rows.push((name.clone(), u.day, u.sessions, u.events, u.revenue, u.top));
-        }
+        user_rows.extend_from_slice(&out.users);
     }
     timer.log(&format!("merged {} user rows", user_rows.len()));
 
     std::fs::create_dir_all(out_dir.join("user_daily")).expect("create output dir");
     std::fs::create_dir_all(out_dir.join("campaign_daily")).expect("create output dir");
-    write_tables(
-        &out_dir,
-        &products.names,
-        user_rows,
-        &campaigns,
-        &dims,
-        &credited,
-        &assisted,
-    )
-    .expect("write parquet");
+    let (users_done, campaigns_done) = rayon::join(
+        || write_users(&out_dir, &products.names, &names, &user_rows, &dims, ncpu.clamp(1, 8)),
+        || write_tables(&out_dir, &campaigns, &dims, &credited, &assisted).map_err(|e| e.to_string()),
+    );
+    users_done.expect("write user_daily");
+    campaigns_done.expect("write campaign_daily");
     timer.log("wrote user_daily and campaign_daily");
+    // Both tables are written and closed: skip tearing down the large structures.
+    std::process::exit(0);
 }
