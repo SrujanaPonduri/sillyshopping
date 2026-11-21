@@ -189,6 +189,9 @@ def canonical(df, cols):
     return df.sort(cols)
 
 
+IMPL = None  # set by --impl: command to test instead of pipeline/pipeline.py
+
+
 def run_seed(seed, n_events, n_clicks, keep):
     tmp = tempfile.mkdtemp(prefix=f"sscheck-{seed}-")
     data = os.path.join(tmp, "data")
@@ -199,7 +202,8 @@ def run_seed(seed, n_events, n_clicks, keep):
     os.makedirs(scratch)
     os.makedirs(out_pipe)
     env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out_pipe, SCRATCH_DIR=scratch, NCPU="4", MEM_GB="4")
-    p = subprocess.run([PY, os.path.join(ROOT, "pipeline", "pipeline.py")], env=env, capture_output=True, text=True)
+    cmd = [IMPL] if IMPL else [PY, os.path.join(ROOT, "pipeline", "pipeline.py")]
+    p = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if p.returncode != 0:
         print(f"seed {seed}: pipeline failed\n{p.stderr[-3000:]}")
         return False
@@ -243,7 +247,10 @@ def main():
     parser.add_argument("--events", type=int, default=1500)
     parser.add_argument("--clicks", type=int, default=600)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--impl", default=None, help="binary to test instead of the Python pipeline")
     args = parser.parse_args()
+    global IMPL
+    IMPL = args.impl
     results = [run_seed(s, args.events, args.clicks, args.keep) for s in range(1, args.seeds + 1)]
     print(f"{sum(results)}/{len(results)} seeds match")
     sys.exit(0 if all(results) else 1)

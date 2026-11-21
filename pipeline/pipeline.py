@@ -29,12 +29,6 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 
-import duckdb
-import numpy as np
-import polars as pl
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-
 os.environ.setdefault("POLARS_MAX_THREADS", "1")  # set before polars starts threads; parse workers are processes
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -68,36 +62,59 @@ KEYS = {"events": "event_id", "clicks": "click_id", "links": None}
 COLS = {"events": EVENT_COLS, "clicks": CLICK_COLS, "links": LINK_COLS}
 
 
-def iter_line_batches(path):
-    """Yield lists of raw lines (bytes, no newline), header excluded, in file order.
+RANGE_BYTES = 16 << 20  # target size of one parse task
 
-    Only b'\\n' ends a line. Lines are split from raw bytes, so every \\r stays
-    in the field it belongs to.
+
+def _next_line_start(f, pos, size):
+    """Smallest line start >= pos (line starts are 0 and each byte after a b'\\n')."""
+    if pos <= 0:
+        return 0
+    if pos >= size:
+        return size
+    f.seek(pos - 1)
+    if f.read(1) == b"\n":
+        return pos
+    while True:
+        block = f.read(1 << 20)
+        if not block:
+            return size
+        idx = block.find(b"\n")
+        if idx >= 0:
+            return f.tell() - len(block) + idx + 1
+
+
+def plan_ranges(path):
+    """Split one file into newline-aligned byte ranges [start, end) of about RANGE_BYTES.
+
+    A line belongs to the range where it starts, so the ranges cover every line exactly once.
     """
-    skipped = False
-    rest = b""
+    size = os.path.getsize(path)
+    if size == 0:
+        return []
+    cuts = {0, size}
     with open(path, "rb") as f:
-        while True:
-            block = f.read(CHUNK_BYTES)
-            if not block:
-                break
-            data = rest + block
-            cut = data.rfind(b"\n")
-            if cut < 0:
-                rest = data
-                continue
-            rest = data[cut + 1:]
-            lines = data[:cut].split(b"\n")
-            if not skipped:
-                lines = lines[1:]
-                skipped = True
-            if lines:
-                yield lines
-    if rest and skipped:  # final line without a trailing newline
-        yield [rest]
+        for k in range(1, size // RANGE_BYTES + 1):
+            cuts.add(_next_line_start(f, k * RANGE_BYTES, size))
+    cuts = sorted(c for c in cuts if 0 <= c <= size)
+    return [(a, b) for a, b in zip(cuts, cuts[1:]) if a < b]
+
+
+def iter_range_lines(path, start, end, skip_header):
+    """Yield the raw lines (bytes) that start inside [start, end), header excluded."""
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read(end - start)
+    lines = data.split(b"\n")
+    if data.endswith(b"\n"):
+        lines.pop()  # the empty piece after the last newline is not a line
+    if skip_header:
+        lines = lines[1:]
+    if lines:
+        yield lines
 
 
 def parse_batch(lines, names):
+    import polars as pl
     """Apply the dialect to one batch. Returns a DataFrame with one string column per name.
 
     A field is valid when it has no quote, or is one quoted run with no quote inside.
@@ -125,12 +142,14 @@ def parse_batch(lines, names):
 
 
 def parse_file(task):
-    """Parse one CSV file into Parquet batches. Runs in a worker process."""
-    kind, path, file_no, out_dir = task
+    """Parse one byte range of one CSV file into Parquet. Runs in a worker process."""
+    import polars as pl
+
+    kind, path, start, end, skip_header, tag, out_dir = task
     cols = COLS[kind]
     rows = 0
     batches = 0
-    for batch_no, lines in enumerate(iter_line_batches(path)):
+    for batch_no, lines in enumerate(iter_range_lines(path, start, end, skip_header)):
         df = parse_batch(lines, cols)
         if kind == "events":
             df = df.filter(pl.col("event_id").is_not_null())
@@ -140,17 +159,21 @@ def parse_file(task):
             df = df.filter(pl.col("user_id_a").is_not_null() & pl.col("user_id_b").is_not_null())
         if df.height == 0:
             continue
-        df.write_parquet(os.path.join(out_dir, f"f{file_no:05d}-b{batch_no:05d}.parquet"))
+        df.write_parquet(os.path.join(out_dir, f"{tag}-b{batch_no:05d}.parquet"))
         rows += df.height
         batches += 1
     return rows, batches
 
 
 def parse_kind(kind, out_dir, pool):
+    import polars as pl
     """Parse all CSVs of one kind into Parquet batches under out_dir, files in parallel."""
     os.makedirs(out_dir, exist_ok=True)
     files = sorted(glob.glob(os.path.join(DATA, kind, "*.csv")))
-    tasks = [(kind, path, i, out_dir) for i, path in enumerate(files)]
+    tasks = []
+    for file_no, path in enumerate(files):
+        for range_no, (start, end) in enumerate(plan_ranges(path)):
+            tasks.append((kind, path, start, end, start == 0, f"f{file_no:05d}-r{range_no:04d}", out_dir))
     results = list(pool.map(parse_file, tasks)) if tasks else []
     rows = sum(r for r, _ in results)
     batches = sum(b for _, b in results)
@@ -215,12 +238,18 @@ def main():
 
 
 def run(run_dir):
+    import duckdb
+    import numpy as np
+    import polars as pl
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
     ws, we = parse_manifest()
     log(f"window {ws}..{we} ms")
 
     scratch_parsed = os.path.join(run_dir, "parsed")
     # Worker processes parse files in parallel; polars is limited to one thread each.
-    ctx = multiprocessing.get_context("spawn")
+    ctx = multiprocessing.get_context("fork")  # no re-import per worker; the pool exists before polars/duckdb run
     with ProcessPoolExecutor(max_workers=NCPU, mp_context=ctx) as pool:
         for kind in ("events", "clicks", "links"):
             parse_kind(kind, os.path.join(scratch_parsed, kind), pool)

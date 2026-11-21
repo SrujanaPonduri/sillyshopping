@@ -1,75 +1,69 @@
-# Shopping Sessions: DuckDB pipeline
+# Shopping Sessions
 
-A complete implementation of `rules.md` for the Shopping Sessions benchmark. It reads `/data`, writes `/output/user_daily/` and `/output/campaign_daily/` as Parquet, and runs with no arguments.
+An implementation of `rules.md` for the Shopping Sessions benchmark. It reads `/data` and writes `/output/user_daily/` and `/output/campaign_daily/` as Parquet. The image runs with no arguments.
+
+The production program is a native Rust binary in [rust/](rust/). The earlier DuckDB/Polars version in [pipeline/pipeline.py](pipeline/pipeline.py) is kept as the readable reference that the tests compare against.
 
 ## Status
 
-| Check | Status |
+| Check | Result |
 | --- | --- |
-| All 36 edge-case fixtures (`fixtures/`), run locally with Python | **Passes, 36/36** |
-| Randomized differential test against a naive reference (`tests/`), 8 seeds of 20k events plus 8 small seeds | **All match** |
-| 2M-event benchmark data, pipeline output vs the naive reference | **Exact match**, both tables |
-| 20M and 60M benchmark data, self-checks (sums, types) | **Pass** (no reference run at this size) |
-| Dev set: `generate --seed 1 --events 1000000 --clicks 250000`, pipeline run locally, `scripts/compare.py` against `dev-answer/` | **MATCH.** 117,038 user rows and 27,400 campaign rows, no missing or extra rows. Run with local Python, not in Docker |
-| Docker image build (`linux/amd64`) | **Builds**, and the image is `amd64` |
-| 36 fixtures in the container (`make fixtures`, scorer flags) | **Passes, 36/36** |
-| Dev set in the container (`make run-dev` then `make check-dev`, scorer flags) | **MATCH**, same counts as above. The Docker VM has 8 GB of memory, so the 24 GB limit is not enforced here |
-| Hidden practice submission | **Not made** |
+| 36 fixtures, Rust binary, local | **36/36 pass** |
+| 36 fixtures, Rust binary, in the `linux/amd64` container with scorer flags | **36/36 pass** |
+| Dev set (`generate --seed 1 --events 1000000 --clicks 250000`) vs `dev-answer/`, Rust, local and in container | **MATCH** |
+| 5M and 20M benchmark sets, Rust vs the Python reference's output | **identical** (both tables, full sorted rows and schema) |
+| Randomized differential test vs `tests/reference.py`, 12 seeds, Rust | **all match** |
+| Same test with tiny parse ranges (boundary handling), Rust | **all match** |
+| Determinism: 20M set at 1, 4, and 8 threads, and with tiny ranges | **identical** every time |
+| 60M benchmark set: self-checks (sums, assists rule) | **pass** |
 
-Before any submission, the one check still open is a 60M-event run in the container. That needs about 8 GB of memory, and the Docker VM here has only 8 GB, so raise Docker Desktop's memory first. The Dockerfile is unchanged from the starter; `requirements.txt` changed (see below).
-
-**Polars version.** The pipeline was first pinned to `polars==2.1.0`. In the `linux/amd64` image under emulation on this Mac, that build segfaults on the first DataFrame operation, even though the CPU reports AVX2. The image now uses `polars-lts-cpu==1.33.1`, a build for older CPUs with the same API surface the pipeline uses. The fixtures, the random tests and the 2M benchmark were all rerun on 1.33.1 before the image was rebuilt. The scorer's Xeon CPUs have AVX-512 and may not need this change, but the pin works on both.
+The 60M benchmark data comes from `tests/perf_gen.py`. It has realistic shape but is **not** the challenge generator, so it isn't a substitute for the official dev-set check.
 
 ## Running
 
 ```sh
-# Local, no Docker: all 36 fixtures plus randomized checks against the reference
-make test-local
+make build            # Rust image for linux/amd64 (the Dockerfile compiles the binary)
+make fixtures         # 36 fixtures in the container, scorer flags
+make dev && make run-dev && make check-dev    # needs the generator on PATH and dev-answer/ unzipped here
 
-# Docker, as the scorer runs it (needs Docker with buildx)
-make fixtures          # 36 fixtures in the container
-make dev && make run-dev && make check-dev   # needs generator on PATH and dev-answer/ unzipped here
+# Native, without Docker
+cd rust && cargo build --release
+DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out NCPU=8 ./rust/target/release/shopping-sessions
 ```
 
-`pipeline/pipeline.py` reads `DATA_DIR`, `OUTPUT_DIR`, `SCRATCH_DIR`, `NCPU` and `MEM_GB`, with the same defaults as the starter. Logs go to stderr. Each run uses its own folder under `SCRATCH_DIR`, which is removed at exit.
+Environment: `DATA_DIR` (default `/data`), `OUTPUT_DIR` (default `/output`), `NCPU` (thread count, default 8). The Rust program uses only memory. It writes nothing except the two output folders and logs to stderr. `SS_RANGE_BYTES` is a test-only override of the parse range size.
 
-## Architecture
+## Architecture (Rust)
 
-1. **CSV parsing** (`parse_file`, `parse_batch`). Each file is read as raw bytes in 64 MiB blocks and split on `\n` only. DuckDB and Polars both strip a `\r` that precedes `\n`, and the rules keep it, so the parser does not use a native CSV reader. Each line is split on `,`. A field is valid when it has no quote, or when it is one quoted run with no quote inside. A line with the wrong number of fields, or any invalid field, is dropped. Files are parsed in parallel worker processes, each limited to one Polars thread. Parsed batches go to Parquet under `SCRATCH_DIR`.
-2. **Identity** (`connected_components`). Linked IDs become integer nodes, and one SciPy connected-components pass gives each component. Each person is named by the byte-wise smallest of its IDs. An ID that is not linked keeps its own name.
-3. **Events** (SQL). Dedup on `event_id` keeps the copy with the smallest `ingest_ts`. Validation runs on that kept copy only. Late events are dropped when `ingest_ts - ts > 24 h`.
-4. **Sessions** (SQL). Distinct `(person, ts)` pairs are ordered. A new session starts when the gap to the previous distinct timestamp is over 1,800,000 ms. Every event takes the start of its session, and the session's day is the UTC date of that start.
-5. **Clicks and acquisition credit** (SQL). Clicks are deduped on `click_id` and validated. Clicks that share a `(person, ts)` are reduced to the smallest `click_id`. For each session an ASOF join finds the latest click at or before the session start. The click credits the session when the gap is at most 7 days, and otherwise the session is `organic`.
-6. **Assists** (SQL). For each `(person, campaign)`, click times are merged into intervals `[ts, ts + 7 days]` (closed at both ends). A session is assisted by a campaign exactly when its start falls in one of that campaign's intervals. The count per campaign and day comes from rank differences over each person's sorted session starts, using ASOF lookups. This avoids materializing one row per (session, campaign) pair, which would be very large for the whale users.
-7. **Outputs**. `user_daily` aggregates sessions by person and day, and `top_category` breaks ties by the byte-wise smallest category. `campaign_daily` combines credited sessions with assisted counts and keeps rows that have at least one credited session or one assist. All numeric outputs are cast to `BIGINT`, and `day` is `DATE`.
+1. **Input.** Each CSV is memory-mapped and split into newline-aligned byte ranges of about 16 MB. Every line starts in exactly one range. Ranges are parsed in parallel, and the header is skipped only in the first range of each file.
+2. **CSV dialect.** A line is split on commas and must have exactly the right number of fields. A field is valid if it has no quote, or is one quoted run with no quote inside. Quotes are removed, `""` is null, and `\r` stays as a byte of its field. Every value is a slice into the mapped file, so nothing is copied.
+3. **Timestamps and prices.** The three timestamp forms are parsed by hand, with calendar checks (leap years, hour 24, second 60) and offset checks. Prices are digits only, from 1 to 10,000,000.
+4. **Events.** Dedup on `event_id` is sharded by hash across 64 shards, and each shard keeps the copy with the smallest `ingest_ts`. Validation runs on the kept copy only.
+5. **Identity.** Every user ID is interned into a sharded hash table, giving a dense integer ID. Union-find over the linked pairs (iterative, with path halving) gives components. Each person is named by the byte-wise smallest ID in its component, computed once per ID.
+6. **Sessions.** Events are sorted by one packed key, `person << 32 | (ts - window start)`, and scanned once. A new session starts when the gap between distinct timestamps exceeds 1,800,000 ms.
+7. **Attribution.** For each person, the credit rule is a merge walk over sorted sessions and clicks. Assists use merged click intervals `[ts, ts + 7 days]`, and each interval is matched to a session range by binary search, per day. The amount of work is proportional to the number of clicks, not to sessions times campaigns.
+8. **Aggregation.** Work is split into chunks at person boundaries and run in parallel. The outputs are per-(person, day) rows and dense (campaign, day) arrays, which are summed across chunks.
+9. **Output.** Both tables are written with the Arrow Parquet writer. `day` is `DATE32`, and all counts are `INT64`.
 
-## Performance (measured here, not on the scorer)
+## Performance
 
-Machine: a Mac with 11 cores and 18 GB of RAM. Runs used `NCPU=8` and `MEM_GB=12` (DuckDB memory limit 9.6 GB). The data came from `tests/perf_gen.py`, a benchmark generator with realistic shape but **not** the challenge generator. It uses one user per 30 events (about 667k users at 20M events and 2M at 60M). Each figure is one run.
+Measured natively on this Mac (11 cores, 18 GB, currently swapping). The inputs are the benchmark sets from `tests/perf_gen.py`. Times are wall time for the whole process, including reading the input.
 
-| Input | Wall time | Peak RSS |
+| Input | Python reference (Polars + DuckDB, natively) | Rust, final |
 | --- | --- | --- |
-| 2M events | ~3 s | 1.3 GB (serial parse, before parallel parse) |
-| 20M events | 17.3 s | 6.0 GB |
-| 60M events | 61.4 s | 8.0 GB |
+| 20M events | 14.9 s | 2.2 s to 3.1 s (3 runs) |
+| 60M events | 52 s | 22.7 s to 125.7 s across three runs; median 47 s |
 
-Stage times for the 60M run: parse 15 s, events and dedup 15 s, sessions 8 s, clicks and credit 3 s, assists 17 s, write 1.5 s.
+The 60M spread comes from this Mac swapping: 4.5 GB of swap was in use, and the first run had to read the inputs back from disk. Peak RSS was 8.8 GB, against 24 GB on the scorer, which has no swap. These numbers are **not** the scorer's timing. Quit Docker Desktop before a native benchmark, or measure on the scorer's machine. The container's own speed on this Mac is not representative, since it runs amd64 under emulation.
 
-The 60M run is above the 60-second practice target. The largest stage is assists. Ideas not yet tried: sorting sessions once and reusing that order for both ASOF joins, and splitting the parse stage for large files. Neither is implemented, and neither has been measured.
-
-## Verification notes
-
-- `tests/reference.py` is a deliberately naive implementation of `rules.md`, written separately from the pipeline and used only for testing.
-- `tests/random_check.py` generates dirty random data with duplicates, malformed lines, all three timestamp forms, bad timestamps, `\r` line endings, linked IDs, and boundary clicks. It runs both implementations and compares the tables exactly.
-- Random-test generator fixes: duplicate copies of a click are byte-identical, and duplicate events carry a later whole-second `ingest_ts`. The spec requires both properties. Earlier generator runs broke them, and the resulting mismatches were in the test data, not in the pipeline.
-- `tests/perf_gen.py` writes benchmark inputs. Its output is not the official data and is not compared with `dev-answer/`.
+Stage times at 60M (fastest run): parse 1.5 s for events, 0.6 s for clicks and links; events dedup and validation 8.3 s; intern 3.8 s; events sort 3.0 s; clicks sort 0.7 s; sessions, credit, and assists 3.9 s; write 0.5 s. Dedup and interning are the largest costs, and both can likely be trimmed.
 
 ## Files
 
-- `pipeline/pipeline.py`: the pipeline.
-- `tests/reference.py`: naive reference implementation for testing.
-- `tests/random_check.py`: randomized differential test.
-- `tests/perf_gen.py`: benchmark input generator, not the challenge generator.
-- `fixtures/`: the 36 edge-case fixtures, unchanged from the starter.
-- `scripts/`: fixture runner, scorer-style Docker runner, and dev comparison, unchanged from the starter.
-- `Dockerfile`, `Makefile`, `run.sh`, `requirements.txt`: packaging. `requirements.txt` now pins `polars`, `numpy` and `scipy` as well as `duckdb`.
+- `rust/src/main.rs`, `rust/src/parse.rs`: the pipeline. `rust/Cargo.lock` pins the dependencies. Build with `--locked`.
+- `Dockerfile`: builds the Rust binary in a Rust image, then copies it into a slim runtime image that runs as uid 1000.
+- `pipeline/pipeline.py`: the Python reference, kept for tests.
+- `tests/reference.py`: naive reference implementation.
+- `tests/random_check.py`: randomized differential test. Use `--impl` to test a binary, for example `--impl ./rust/target/release/shopping-sessions`.
+- `tests/perf_gen.py`: benchmark input generator (not the challenge generator).
+- `fixtures/`, `scripts/`, `Makefile`, `requirements.txt`, `TEAM.md`: unchanged from the starter, except `requirements.txt`, which the Python reference still uses.
