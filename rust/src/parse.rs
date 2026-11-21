@@ -164,6 +164,120 @@ fn field<'a>(f: &'a [u8], quotes: usize, wrapped: &mut usize) -> Option<&'a [u8]
     }
 }
 
+/// Calls `f(line, fields)` for every well-formed line of `data` that has exactly `n` fields (n <= 7), header
+/// excluded when `skip_header`. Same result as `for_each_line` followed by `split_fields`, but with AVX2 the
+/// line ends, commas and quotes are found together in one pass over 64-byte blocks.
+pub fn for_each_record<'a>(
+    data: &'a [u8],
+    skip_header: bool,
+    n: usize,
+    mut f: impl FnMut(&'a [u8], &[Option<&'a [u8]>; 8]),
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU supports AVX2, checked just above.
+            unsafe { scan_avx2(data, skip_header, n, &mut f) };
+            return;
+        }
+    }
+    let mut fields: [Option<&'a [u8]>; 8] = [None; 8];
+    for_each_line(data, skip_header, |line| {
+        if split_fields(line, n, &mut fields) {
+            f(line, &fields);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt,bmi1")]
+unsafe fn scan_avx2<'a>(
+    data: &'a [u8],
+    skip_header: bool,
+    n: usize,
+    f: &mut impl FnMut(&'a [u8], &[Option<&'a [u8]>; 8]),
+) {
+    use std::arch::x86_64::*;
+    let len = data.len();
+    let last = n - 1;
+    let vc = _mm256_set1_epi8(b',' as i8);
+    let vn = _mm256_set1_epi8(b'\n' as i8);
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let mut fields: [Option<&'a [u8]>; 8] = [None; 8];
+    let mut commas = [0usize; 8];
+    let mut ncomma = 0usize;
+    let mut quotes = 0usize;
+    let mut line_start = 0usize;
+    let mut line_no = 0usize;
+    let mut pos = 0usize;
+    let mut tail = [0u8; 64];
+
+    // Finish the line [line_start, end): validate and hand it to `f`.
+    macro_rules! finish_line {
+        ($end:expr) => {{
+            let end: usize = $end;
+            if !(skip_header && line_no == 0) && ncomma == last {
+                let line = &data[line_start..end];
+                let mut wrapped = 0usize;
+                let mut st = line_start;
+                for k in 0..n {
+                    let e = if k < last { commas[k] } else { end };
+                    fields[k] = field(&data[st..e], quotes, &mut wrapped);
+                    st = e + 1;
+                }
+                if quotes == 2 * wrapped {
+                    f(line, &fields);
+                }
+            }
+            line_no += 1;
+            line_start = end + 1;
+            ncomma = 0;
+            quotes = 0;
+        }};
+    }
+
+    while pos < len {
+        let p: *const u8 = if pos + 64 <= len {
+            data.as_ptr().add(pos)
+        } else {
+            let rem = len - pos;
+            tail = [0u8; 64];
+            tail[..rem].copy_from_slice(&data[pos..]);
+            tail.as_ptr()
+        };
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let m = |a: __m256i, b: __m256i, t: __m256i| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, t)) as u32 as u64)
+                | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, t)) as u32 as u64) << 32)
+        };
+        let cm = m(v0, v1, vc);
+        let nm = m(v0, v1, vn);
+        let mut qm = m(v0, v1, vq);
+        let mut ev = cm | nm;
+        while ev != 0 {
+            let b = ev.trailing_zeros() as usize;
+            ev &= ev - 1;
+            if (nm >> b) & 1 != 0 {
+                quotes += (qm & ((1u64 << b) - 1)).count_ones() as usize;
+                qm &= if b == 63 { 0 } else { !((1u64 << (b + 1)) - 1) };
+                finish_line!(pos + b);
+            } else {
+                if ncomma < 8 {
+                    commas[ncomma] = pos + b;
+                }
+                ncomma += 1;
+            }
+        }
+        quotes += qm.count_ones() as usize;
+        pos += 64;
+    }
+    let _ = &tail;
+    if line_start < len {
+        finish_line!(len);
+    }
+}
+
 /// Call `f` for every line that starts inside `data`, header excluded when `skip_header`.
 pub fn for_each_line<'a>(data: &'a [u8], skip_header: bool, mut f: impl FnMut(&'a [u8])) {
     let mut start = 0usize;
