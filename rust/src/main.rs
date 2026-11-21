@@ -1170,6 +1170,72 @@ struct Shared<'a> {
     kill_off: &'a [usize],
 }
 
+/// Small open-addressing map from a person hash to a dense number, growing as persons are added.
+struct LocalIds {
+    keys: Vec<u64>,
+    vals: Vec<u32>, // u32::MAX when the slot is empty
+    len: usize,
+}
+
+impl LocalIds {
+    fn new() -> Self {
+        LocalIds { keys: vec![0; 64], vals: vec![u32::MAX; 64], len: 0 }
+    }
+    #[inline]
+    fn find(&self, p: u64) -> Option<u32> {
+        let mask = self.keys.len() - 1;
+        let mut i = (p as usize) & mask;
+        loop {
+            let v = self.vals[i];
+            if v == u32::MAX {
+                return None;
+            }
+            if self.keys[i] == p {
+                return Some(v);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+    #[inline]
+    fn get_or_insert(&mut self, p: u64, persons: &mut Vec<u64>) -> u32 {
+        let mask = self.keys.len() - 1;
+        let mut i = (p as usize) & mask;
+        loop {
+            let v = self.vals[i];
+            if v == u32::MAX {
+                break;
+            }
+            if self.keys[i] == p {
+                return v;
+            }
+            i = (i + 1) & mask;
+        }
+        let id = persons.len() as u32;
+        persons.push(p);
+        self.keys[i] = p;
+        self.vals[i] = id;
+        self.len += 1;
+        if self.len * 2 > self.keys.len() {
+            self.grow(persons);
+        }
+        id
+    }
+    #[cold]
+    fn grow(&mut self, persons: &[u64]) {
+        let cap = self.keys.len() * 2;
+        self.keys = vec![0; cap];
+        self.vals = vec![u32::MAX; cap];
+        for (id, &p) in persons.iter().enumerate() {
+            let mut i = (p as usize) & (cap - 1);
+            while self.vals[i] != u32::MAX {
+                i = (i + 1) & (cap - 1);
+            }
+            self.keys[i] = p;
+            self.vals[i] = id as u32;
+        }
+    }
+}
+
 /// Everything for one person partition: its events and clicks are gathered from the workers, copies that lost
 /// dedup are dropped, and sessions, credit and assists are computed while the records sit in the cache.
 fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) {
@@ -1192,67 +1258,111 @@ fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) 
             bits[b >> 6] >> (b & 63) & 1 == 0 || kl.binary_search(&(((p as u64) << 48) | ptr)).is_err()
         });
     }
-    evs.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-
-    // dense local person numbers in person-hash order, and each person's name
-    let mut names: Vec<Bytes> = Vec::new();
-    let mut persons: Vec<u64> = Vec::new();
-    let mut es: Vec<EvS> = Vec::with_capacity(evs.len());
-    for (i, e) in evs.iter().enumerate() {
-        if i == 0 || e.person != evs[i - 1].person {
-            persons.push(e.person);
-            let name = if e.lp & LINKED != 0 { sh.ctx.links.name(e.person) } else { None };
-            names.push(name.unwrap_or_else(|| line_field(e.lp, 7, 1)));
-        }
-        es.push(EvS {
-            key: ((persons.len() as u64 - 1) << 32) | e.ts as u64,
-            price: e.price,
-            cat: ((e.lp >> 48) & 0xFF) as u8,
-            typ: if e.price > 0 { PURCHASE } else { 1 },
-        });
+    if evs.is_empty() {
+        return;
+    }
+    // Group the events by person without a comparison sort over the whole partition: give every person a dense
+    // number (first seen), order the numbers by person hash so the output does not depend on arrival order, move
+    // the records to their person's run with a counting pass, then sort each short run by time.
+    let mut map = LocalIds::new();
+    let mut pers: Vec<u64> = Vec::new();
+    let ids: Vec<u32> = evs.iter().map(|e| map.get_or_insert(e.person, &mut pers)).collect();
+    let np = pers.len();
+    let mut order: Vec<u32> = (0..np as u32).collect();
+    order.sort_unstable_by_key(|&i| pers[i as usize]);
+    let mut rank = vec![0u32; np];
+    for (r, &i) in order.iter().enumerate() {
+        rank[i as usize] = r as u32;
+    }
+    let mut start = vec![0u32; np + 1];
+    for &id in &ids {
+        start[rank[id as usize] as usize + 1] += 1;
+    }
+    for r in 0..np {
+        start[r + 1] += start[r];
+    }
+    let mut fill: Vec<u32> = start[..np].to_vec();
+    let mut sorted: Vec<Ev> = vec![evs[0]; evs.len()];
+    for (e, &id) in evs.iter().zip(&ids) {
+        let r = rank[id as usize] as usize;
+        sorted[fill[r] as usize] = *e;
+        fill[r] += 1;
     }
     drop(evs);
+    drop(ids);
 
-    // clicks of persons that have events here; identical copies removed, ties in click-id order
-    let mut cks: Vec<Ck> = gather(sh.states, |s| &s.cks, p);
-    cks.sort_unstable_by(|a, b| a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)));
-    let mut cls: Vec<ClS> = Vec::with_capacity(cks.len());
-    let lo = sh.ctx.lo;
-    let mut pi = 0usize;
-    let mut i = 0usize;
-    while i < cks.len() {
-        let person = cks[i].person;
-        let mut j = i;
-        while j < cks.len() && cks[j].person == person {
-            j += 1;
+    let mut names: Vec<Bytes> = Vec::with_capacity(np);
+    let mut es: Vec<EvS> = Vec::with_capacity(sorted.len());
+    for r in 0..np {
+        let run = &mut sorted[start[r] as usize..start[r + 1] as usize];
+        if run.len() > 1 {
+            run.sort_unstable_by_key(|e| e.ts);
         }
-        while pi < persons.len() && persons[pi] < person {
-            pi += 1;
+        let first = run[0];
+        let name = if first.lp & LINKED != 0 { sh.ctx.links.name(first.person) } else { None };
+        names.push(name.unwrap_or_else(|| line_field(first.lp, 7, 1)));
+        for e in run.iter() {
+            es.push(EvS {
+                key: ((r as u64) << 32) | e.ts as u64,
+                price: e.price,
+                cat: ((e.lp >> 48) & 0xFF) as u8,
+                typ: if e.price > 0 { PURCHASE } else { 1 },
+            });
         }
-        if pi < persons.len() && persons[pi] == person {
-            let mut a = i;
-            while a < j {
+    }
+    drop(sorted);
+
+    // clicks of persons that have events here, grouped the same way; identical copies removed, ties in click-id order
+    let cks: Vec<Ck> = gather(sh.states, |s| &s.cks, p);
+    let mut cstart = vec![0u32; np + 1];
+    let crank: Vec<u32> = cks
+        .iter()
+        .map(|c| match map.find(c.person) {
+            Some(id) => {
+                let r = rank[id as usize];
+                cstart[r as usize + 1] += 1;
+                r
+            }
+            None => u32::MAX,
+        })
+        .collect();
+    for r in 0..np {
+        cstart[r + 1] += cstart[r];
+    }
+    let mut cls: Vec<ClS> = Vec::with_capacity(cstart[np] as usize);
+    if cstart[np] > 0 {
+        let mut cfill: Vec<u32> = cstart[..np].to_vec();
+        let mut csorted: Vec<Ck> = vec![cks[0]; cstart[np] as usize];
+        for (c, &r) in cks.iter().zip(&crank) {
+            if r != u32::MAX {
+                csorted[cfill[r as usize] as usize] = *c;
+                cfill[r as usize] += 1;
+            }
+        }
+        let lo = sh.ctx.lo;
+        for r in 0..np {
+            let run = &mut csorted[cstart[r] as usize..cstart[r + 1] as usize];
+            if run.len() > 1 {
+                run.sort_unstable_by_key(|c| c.ts);
+            }
+            let mut a = 0;
+            while a < run.len() {
                 let mut b = a + 1;
-                while b < j && cks[b].ts == cks[a].ts {
+                while b < run.len() && run[b].ts == run[a].ts {
                     b += 1;
                 }
                 if b - a > 1 {
-                    cks[a..b].sort_unstable_by(|x, y| line_field(x.lp, 4, 0).cmp(line_field(y.lp, 4, 0)));
+                    run[a..b].sort_unstable_by(|x, y| line_field(x.lp, 4, 0).cmp(line_field(y.lp, 4, 0)));
                 }
                 for k in a..b {
-                    if k > a && line_field(cks[k].lp, 4, 0) == line_field(cks[k - 1].lp, 4, 0) {
+                    if k > a && line_field(run[k].lp, 4, 0) == line_field(run[k - 1].lp, 4, 0) {
                         continue;
                     }
-                    cls.push(ClS {
-                        key: ((pi as u64) << 32) | cks[k].ts as u64,
-                        ts: cks[k].ts as i64 + lo,
-                        camp: cks[k].camp,
-                    });
+                    cls.push(ClS { key: ((r as u64) << 32) | run[k].ts as u64, ts: run[k].ts as i64 + lo, camp: run[k].camp });
                 }
                 a = b;
             }
         }
-        i = j;
     }
     drop(cks);
 
