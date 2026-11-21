@@ -14,7 +14,7 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | f4c19d3 | glibc huge pages via GLIBC_TUNABLES | 2.81 s / 2.83 s |
 | b97e7e0 | parallel identity + merge | 2.70 s |
 | 9d04f4c | stage 3+4: compact records, per-partition pipeline, no interning | 2.52 s |
-| 33a0e2f | date cache in timestamp parser, buffer reuse in sessions step | not yet run (merged to main) |
+| 33a0e2f | date cache in timestamp parser, buffer reuse in sessions step | 2.30 s |
 
 ## Sandbox experiments
 
@@ -25,6 +25,7 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | date cache + reused buffers (33a0e2f) | 2.746G -> 2.550G instructions (-7.1%), 1M dev set | sandbox, callgrind |
 
 | per-partition grouping: counting pass by person + short per-person sorts instead of a comparison sort over the partition | 1M dev set 2.550G -> 2.463G instructions (-3.4%); 20M NCPU=1 user time median of 5: 8.85 s -> 8.49 s (-4%), non-LTO, noisy | sandbox |
+| fused AVX2 line/comma/quote scanner (runtime-detected, old splitter as fallback); fuzz vs old path 0 mismatches in 400k buffers | 1M dev set 2.463G -> 2.271G instructions (-7.8%); 20M NCPU=1 user time median of 5 vs the version before the counting pass: 9.40 s -> 8.99 s (-4.4%, includes the counting-pass change), non-LTO, noisy | sandbox |
 
 ## Where the time goes (sandbox, NCPU=1, 20M events, 9d04f4c, LTO)
 
