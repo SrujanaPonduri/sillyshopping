@@ -261,12 +261,43 @@ fn parse_iso(s: &[u8]) -> Option<Option<i64>> {
     if !ok {
         return None;
     }
-    let y = two(s, 0) * 100 + two(s, 2);
-    let (mo, day, h, mi, se) = (two(s, 5), two(s, 8), two(s, 11), two(s, 14), two(s, 17));
-    if off_bad || !(1..=12).contains(&mo) || day < 1 || day > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+    let (h, mi, se) = (two(s, 11), two(s, 14), two(s, 17));
+    if off_bad || h > 23 || mi > 59 || se > 59 {
         return Some(None);
     }
-    Some(Some(((days_from_civil(y, mo, day) * 86_400 + h * 3600 + mi * 60 + se) - off_min * 60) * 1000))
+    // A window holds few distinct dates, so the day number of a date seen before comes from a small
+    // per-thread table keyed by the 10 date bytes. Only valid dates are stored, and the digits and
+    // separators were checked above, so a hit gives exactly what the calendar code would.
+    let d16 = u16::from_le_bytes([s[8], s[9]]) as u64;
+    let slot = ((w0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ d16.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) >> 58) as usize;
+    let cached = DATE_CACHE.with(|c| {
+        // SAFETY: the cell is thread-local and these accesses never overlap.
+        let e = unsafe { (&(*c.get()))[slot] };
+        if e.0 == w0 && e.1 == d16 {
+            Some(e.2)
+        } else {
+            None
+        }
+    });
+    let days = match cached {
+        Some(d) => d,
+        None => {
+            let y = two(s, 0) * 100 + two(s, 2);
+            let (mo, day) = (two(s, 5), two(s, 8));
+            if !(1..=12).contains(&mo) || day < 1 || day > days_in_month(y, mo) {
+                return Some(None);
+            }
+            let d = days_from_civil(y, mo, day);
+            // SAFETY: as above.
+            DATE_CACHE.with(|c| unsafe { (&mut (*c.get()))[slot] = (w0, d16, d) });
+            d
+        }
+    };
+    Some(Some(((days * 86_400 + h * 3600 + mi * 60 + se) - off_min * 60) * 1000))
+}
+
+thread_local! {
+    static DATE_CACHE: std::cell::UnsafeCell<[(u64, u64, i64); 64]> = const { std::cell::UnsafeCell::new([(0, 0, 0); 64]) };
 }
 
 /// Timestamp in integer milliseconds since the epoch, or `None` when bad.

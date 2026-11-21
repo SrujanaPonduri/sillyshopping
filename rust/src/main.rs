@@ -881,7 +881,8 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
     let mut users: Vec<UserRow> = Vec::new();
     let mut acc: Option<(u32, u32, UserRow, Vec<i64>, bool)> = None; // (person, day, row, cat sums, has purchase)
 
-    let flush = |acc: &mut Option<(u32, u32, UserRow, Vec<i64>, bool)>, users: &mut Vec<UserRow>| {
+    let mut spare: Vec<i64> = Vec::new(); // category sums of the finished row, reused by the next one
+    let flush = |acc: &mut Option<(u32, u32, UserRow, Vec<i64>, bool)>, users: &mut Vec<UserRow>, spare: &mut Vec<i64>| {
         if let Some((_, _, mut row, cats, purch)) = acc.take() {
             row.top = -1;
             if purch {
@@ -894,6 +895,7 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
                 }
             }
             users.push(row);
+            *spare = cats;
         }
     };
 
@@ -903,7 +905,7 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
         let person = (e.key >> 32) as u32;
         let ts = (e.key & 0xffff_ffff) as i64 + dims.ws;
         if person != cur_person {
-            flush(&mut acc, &mut users);
+            flush(&mut acc, &mut users, &mut spare);
             cur_person = person;
             last_ts = BAD;
         }
@@ -914,14 +916,11 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
             sessions.push(Sess { person, start: ts, day, purchases: 0, revenue: 0 });
             let same = matches!(&acc, Some((p, d, _, _, _)) if *p == person && *d == day);
             if !same {
-                flush(&mut acc, &mut users);
-                acc = Some((
-                    person,
-                    day,
-                    UserRow { person, day, sessions: 0, events: 0, revenue: 0, top: -1 },
-                    vec![0i64; dims.ncat],
-                    false,
-                ));
+                flush(&mut acc, &mut users, &mut spare);
+                let mut cats = std::mem::take(&mut spare);
+                cats.clear();
+                cats.resize(dims.ncat, 0);
+                acc = Some((person, day, UserRow { person, day, sessions: 0, events: 0, revenue: 0, top: -1 }, cats, false));
             }
             if let Some((_, _, row, _, _)) = acc.as_mut() {
                 row.sessions += 1;
@@ -938,11 +937,12 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
             *purch = true;
         }
     }
-    flush(&mut acc, &mut users);
+    flush(&mut acc, &mut users, &mut spare);
 
     // ---- attribution per person, on the same chunk
     let credited = &mut tot.credited;
     let assisted = &mut tot.assisted;
+    let mut by_camp: Vec<(u32, i64)> = Vec::new();
     let mut si = 0usize;
     let mut ci = 0usize;
     while si < sessions.len() {
@@ -978,7 +978,8 @@ fn process_chunk(dims: &Dims, evs: &[EvS], cls: &[ClS], tot: &mut Acc) -> Vec<Us
         }
 
         // assists: per campaign, merged intervals [ts, ts + 7d]; sessions inside each interval
-        let mut by_camp: Vec<(u32, i64)> = cp.iter().map(|c| (c.camp, c.ts)).collect();
+        by_camp.clear();
+        by_camp.extend(cp.iter().map(|c| (c.camp, c.ts)));
         by_camp.sort_unstable();
         let mut g = 0usize;
         while g < by_camp.len() {
