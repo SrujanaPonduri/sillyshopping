@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use std::env;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -606,6 +607,14 @@ impl Interner {
     }
 }
 
+/// Root of `x` without compressing paths, so it can run on many threads once the unions are done.
+fn find_ro(parent: &[u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        x = parent[x as usize];
+    }
+    x
+}
+
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
         let p = parent[x as usize];
@@ -1093,11 +1102,13 @@ fn main() {
     let n_ids = acc as usize;
     let gid = |p: u64| base[(p >> 32) as usize] + (p & 0xffff_ffff) as u32;
     let mut keys: Vec<Bytes> = vec![&[]; n_ids];
-    for s in 0..SHARDS {
-        for sl in interner.maps[s].slots.iter().filter(|sl| sl.local != u32::MAX) {
-            keys[(base[s] + sl.local) as usize] = sl.key;
+    let keys_ptr = SyncPtr(keys.as_mut_ptr());
+    interner.maps.par_iter().enumerate().for_each(|(s, table)| {
+        for sl in table.slots.iter().filter(|sl| sl.local != u32::MAX) {
+            // SAFETY: shard s owns the global IDs base[s]..base[s] + len, so no two shards write the same index.
+            unsafe { *keys_ptr.get().add((base[s] + sl.local) as usize) = sl.key };
         }
-    }
+    });
 
     let mut parent: Vec<u32> = (0..n_ids as u32).collect();
     let mut size: Vec<u32> = vec![1; n_ids];
@@ -1111,15 +1122,30 @@ fn main() {
             size[big as usize] += size[small as usize];
         }
     }
-    let root: Vec<u32> = (0..n_ids as u32).map(|g| find(&mut parent, g)).collect();
-    // smallest ID per component, compared byte-wise, once per ID
-    let mut best = vec![u32::MAX; n_ids];
-    for g in 0..n_ids {
+    // No more unions: roots can be read without changing the forest, so every ID is resolved in parallel.
+    let root: Vec<u32> = (0..n_ids as u32).into_par_iter().map(|g| find_ro(&parent, g)).collect();
+    // Smallest ID per component, compared byte-wise. An ID that is alone in its component is its own name;
+    // for the others each member competes with a compare-and-swap. Keys are distinct, so the order is total
+    // and the winner does not depend on which thread gets there first.
+    let best_slots: Vec<AtomicU32> = (0..n_ids).map(|_| AtomicU32::new(u32::MAX)).collect();
+    (0..n_ids).into_par_iter().for_each(|g| {
         let r = root[g] as usize;
-        if best[r] == u32::MAX || keys[g] < keys[best[r] as usize] {
-            best[r] = g as u32;
+        if size[r] == 1 {
+            best_slots[r].store(g as u32, Ordering::Relaxed);
+            return;
         }
-    }
+        let mut cur = best_slots[r].load(Ordering::Relaxed);
+        loop {
+            if cur != u32::MAX && keys[g] >= keys[cur as usize] {
+                break;
+            }
+            match best_slots[r].compare_exchange_weak(cur, g as u32, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => cur = now,
+            }
+        }
+    });
+    let best: Vec<u32> = best_slots.par_iter().map(|a| a.load(Ordering::Relaxed)).collect();
     let names = Names { keys, best };
     timer.log(&format!("identity: {} ids, union-find done", n_ids));
 
@@ -1166,7 +1192,7 @@ fn main() {
     }
     cuts.push(evs.len());
     let chunk_ranges: Vec<(usize, usize)> = cuts.windows(2).map(|w| (w[0], w[1])).filter(|(a, b)| a < b).collect();
-    let outs: Vec<ChunkOut> = chunk_ranges
+    let mut outs: Vec<ChunkOut> = chunk_ranges
         .par_iter()
         .enumerate()
         .map(|(k, &(a, b))| {
@@ -1186,7 +1212,7 @@ fn main() {
     // ---- merge
     let mut credited = vec![[0i64; 3]; (dims.ncamp + 1) * nd];
     let mut assisted = vec![0i64; (dims.ncamp + 1) * nd];
-    let mut user_rows: Vec<UserRow> = Vec::with_capacity(outs.iter().map(|o| o.users.len()).sum());
+    let user_rows: Vec<UserRow> = par_concat(outs.iter_mut().map(|o| std::mem::take(&mut o.users)).collect());
     for out in &outs {
         for (dst, src) in credited.iter_mut().zip(&out.credited) {
             for k in 0..3 {
@@ -1196,7 +1222,6 @@ fn main() {
         for (dst, src) in assisted.iter_mut().zip(&out.assisted) {
             *dst += src;
         }
-        user_rows.extend_from_slice(&out.users);
     }
     timer.log(&format!("merged {} user rows", user_rows.len()));
 
