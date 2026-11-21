@@ -23,42 +23,42 @@ pub const MAX_PRICE: i64 = 10_000_000;
 /// `\r` is an ordinary byte and stays in its field.
 #[inline]
 pub fn split_fields<'a>(line: &'a [u8], n: usize, out: &mut [Option<&'a [u8]>; 8]) -> bool {
+    // A line is well formed when every quote belongs to a field that is wrapped in exactly one pair:
+    // so the total quote count must equal 2 x (number of wrapped fields). One SIMD count per line
+    // replaces a quote search inside every field.
+    let quotes = memchr_iter(b'"', line).count();
+    let mut wrapped = 0usize;
     let mut count = 0usize;
     let mut start = 0usize;
     for comma in memchr_iter(b',', line) {
         if count >= n {
             return false;
         }
-        match clean(&line[start..comma]) {
-            Some(v) => out[count] = v,
-            None => return false,
-        }
+        let f = &line[start..comma];
+        out[count] = field(f, quotes, &mut wrapped);
         count += 1;
         start = comma + 1;
     }
     if count + 1 != n {
         return false;
     }
-    match clean(&line[start..]) {
-        Some(v) => out[count] = v,
-        None => return false,
-    }
-    true
+    out[count] = field(&line[start..], quotes, &mut wrapped);
+    quotes == 2 * wrapped
 }
 
-/// `Some(None)` for a null, `Some(Some(v))` for a value, `None` for malformed.
-#[inline]
-fn clean(f: &[u8]) -> Option<Option<&[u8]>> {
-    if memchr(b'"', f).is_none() {
-        return Some(if f.is_empty() { None } else { Some(f) });
-    }
-    if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+/// Value of one field: `None` for empty (null). A field wrapped in quotes loses them and counts as wrapped.
+#[inline(always)]
+fn field<'a>(f: &'a [u8], quotes: usize, wrapped: &mut usize) -> Option<&'a [u8]> {
+    if quotes != 0 && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+        *wrapped += 1;
         let inner = &f[1..f.len() - 1];
-        if memchr(b'"', inner).is_none() {
-            return Some(if inner.is_empty() { None } else { Some(inner) });
-        }
+        return if inner.is_empty() { None } else { Some(inner) };
     }
-    None
+    if f.is_empty() {
+        None
+    } else {
+        Some(f)
+    }
 }
 
 /// Call `f` for every line that starts inside `data`, header excluded when `skip_header`.

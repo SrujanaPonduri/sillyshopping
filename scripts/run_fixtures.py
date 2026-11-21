@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import tempfile
 
 import polars as pl
@@ -59,6 +60,17 @@ def rows(df):
     return sorted(df.rows(), key=lambda r: tuple("" if v is None else str(v) for v in r))
 
 
+
+class _TmpDir:
+    """tempfile.TemporaryDirectory(ignore_cleanup_errors=True) that also works on Python < 3.10."""
+    def __enter__(self):
+        self.path = tempfile.mkdtemp()
+        return self.path
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
 def main():
     sep = sys.argv.index("--")
     fx_dir, cmd = sys.argv[1], sys.argv[sep + 1:]
@@ -70,7 +82,7 @@ def main():
         data = os.path.join(fx_dir, case, "data")
         if not os.path.isdir(data):
             data = os.path.join(fx_dir, case, "input")
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as out:
+        with _TmpDir() as out:
             env = dict(os.environ, DATA_DIR=data, OUTPUT_DIR=out)
             p = subprocess.run(cmd + [data, out], env=env, capture_output=True, text=True)
             if p.returncode != 0:
