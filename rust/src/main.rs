@@ -33,6 +33,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const SHARDS: usize = 64;
+/// Dedup buckets by the top bits of the event-id hash. More buckets keep each bucket's table cache-sized.
+const DEDUP_BITS: u32 = 9;
 /// Target size of one parse task. SS_RANGE_BYTES overrides it for testing boundary handling only.
 fn range_bytes() -> usize {
     env::var("SS_RANGE_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(16 << 20)
@@ -229,7 +231,7 @@ fn parse_events(products: &Products, rs: &RandomState, tasks: &[(Bytes, usize, u
     let parts: Vec<Vec<EvRow>> = tasks
         .par_iter()
         .map(|&(data, start, end, skip)| {
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity((end - start) / 64 + 16); // lines are about 70 bytes
             let mut fields: [Option<Bytes>; 8] = [None; 8];
             for_each_line(&data[start..end], skip, |line| {
                 if !split_fields(line, 7, &mut fields) {
@@ -287,7 +289,7 @@ fn parse_clicks(campaigns: &Campaigns, ws: i64, we: i64, tasks: &[(Bytes, usize,
     let parts: Vec<Vec<CRow>> = tasks
         .par_iter()
         .map(|&(data, start, end, skip)| {
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity((end - start) / 80 + 16);
             let mut fields: [Option<Bytes>; 8] = [None; 8];
             for_each_line(&data[start..end], skip, |line| {
                 if !split_fields(line, 4, &mut fields) {
@@ -332,7 +334,7 @@ fn parse_links(tasks: &[(Bytes, usize, usize, bool)]) -> Vec<(Bytes, Bytes)> {
 
 /// Item indexes grouped by shard, in index order within each shard. Built in parallel:
 /// each worker buckets its own slice, and the per-worker buckets are joined in worker order.
-fn bucket(shards: &[u8]) -> Vec<Vec<u32>> {
+fn bucket(shards: &[u16], nshards: usize) -> Vec<Vec<u32>> {
     let workers = rayon::current_num_threads().max(1);
     let per = shards.len().div_ceil(workers).max(1);
     let parts: Vec<Vec<Vec<u32>>> = (0..workers)
@@ -340,14 +342,14 @@ fn bucket(shards: &[u8]) -> Vec<Vec<u32>> {
         .map(|w| {
             let lo = (w * per).min(shards.len());
             let hi = ((w + 1) * per).min(shards.len());
-            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); SHARDS];
+            let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); nshards];
             for i in lo..hi {
                 buckets[shards[i] as usize].push(i as u32);
             }
             buckets
         })
         .collect();
-    (0..SHARDS)
+    (0..nshards)
         .into_par_iter()
         .map(|s| {
             let total: usize = parts.iter().map(|p| p[s].len()).sum();
@@ -365,42 +367,68 @@ fn bucket(shards: &[u8]) -> Vec<Vec<u32>> {
 /// Rows are bucketed by the top bits of their stored hash; each bucket uses an
 /// open-addressing table that compares the full event_id only when hashes match.
 fn dedup_and_validate(rows: &[EvRow], ws: i64, we: i64) -> Vec<u32> {
-    let shards: Vec<u8> = rows.par_iter().map(|r| (r.eh >> 58) as u8).collect();
-    let buckets = bucket(&shards);
-    let per_shard: Vec<Vec<u32>> = buckets
-        .par_iter()
-        .map(|idxs| {
-            let cap = (idxs.len() * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            // (hash, best row); best row == u32::MAX means empty
-            let mut slots: Vec<(u64, u32)> = vec![(0, u32::MAX); cap];
-            for &i in idxs {
-                let r = &rows[i as usize];
-                let mut pos = (r.eh as usize) & mask;
-                loop {
-                    let (h, cur) = slots[pos];
-                    if cur == u32::MAX {
-                        slots[pos] = (r.eh, i);
-                        break;
-                    }
-                    if h == r.eh && rows[cur as usize].eid == r.eid {
-                        if ing_key(r.ing) < ing_key(rows[cur as usize].ing) {
-                            slots[pos].1 = i;
-                        }
-                        break;
-                    }
-                    pos = (pos + 1) & mask;
+    let shards: Vec<u16> = rows.par_iter().map(|r| (r.eh >> (64 - DEDUP_BITS)) as u16).collect();
+    let buckets = bucket(&shards, 1 << DEDUP_BITS);
+    // Mark the kept rows, then compact the marks in input order: later stages read rows and the
+    // mapped file front to back, which the hardware prefetcher handles far better than table order.
+    let mut flags = vec![0u8; rows.len()];
+    let fptr = SyncPtr(flags.as_mut_ptr());
+    buckets.par_iter().for_each(|idxs| {
+        let cap = (idxs.len() * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        // (hash, best row); best row == u32::MAX means empty
+        let mut slots: Vec<(u64, u32)> = vec![(0, u32::MAX); cap];
+        for &i in idxs {
+            let r = &rows[i as usize];
+            let mut pos = (r.eh as usize) & mask;
+            loop {
+                let (h, cur) = slots[pos];
+                if cur == u32::MAX {
+                    slots[pos] = (r.eh, i);
+                    break;
                 }
+                if h == r.eh && rows[cur as usize].eid == r.eid {
+                    if ing_key(r.ing) < ing_key(rows[cur as usize].ing) {
+                        slots[pos].1 = i;
+                    }
+                    break;
+                }
+                pos = (pos + 1) & mask;
             }
-            slots
-                .iter()
-                .filter(|sl| sl.1 != u32::MAX)
-                .map(|sl| sl.1)
-                .filter(|&i| valid(&rows[i as usize], ws, we))
-                .collect()
-        })
+        }
+        for sl in slots.iter().filter(|sl| sl.1 != u32::MAX) {
+            if valid(&rows[sl.1 as usize], ws, we) {
+                // SAFETY: a row index lives in exactly one bucket and is the winner at most once, so writes never overlap.
+                unsafe { *fptr.get().add(sl.1 as usize) = 1 };
+            }
+        }
+    });
+    let chunk = 1usize << 16;
+    let n = flags.len();
+    let nch = n.div_ceil(chunk);
+    let counts: Vec<usize> = (0..nch)
+        .into_par_iter()
+        .map(|c| flags[c * chunk..((c + 1) * chunk).min(n)].iter().filter(|&&f| f != 0).count())
         .collect();
-    par_concat(per_shard)
+    let mut offs = Vec::with_capacity(nch);
+    let mut total = 0usize;
+    for &c in &counts {
+        offs.push(total);
+        total += c;
+    }
+    let mut kept = vec![0u32; total];
+    let kptr = SyncPtr(kept.as_mut_ptr());
+    (0..nch).into_par_iter().for_each(|c| {
+        let mut pos = offs[c];
+        for i in c * chunk..((c + 1) * chunk).min(n) {
+            if flags[i] != 0 {
+                // SAFETY: chunk c writes only positions offs[c]..offs[c] + counts[c], disjoint from other chunks.
+                unsafe { *kptr.get().add(pos) = i as u32 };
+                pos += 1;
+            }
+        }
+    });
+    kept
 }
 
 #[inline]
@@ -431,8 +459,37 @@ fn valid(r: &EvRow, ws: i64, we: i64) -> bool {
 #[derive(Clone, Copy)]
 struct Slot {
     h: u64,
+    inl: [u64; 2], // inline copy of a short key (see inline_key), so a match needs no read of the key bytes
     key: Bytes,
     local: u32, // u32::MAX when empty
+}
+
+#[derive(Clone, Copy)]
+struct IRec {
+    h: u64,
+    inl: [u64; 2],
+    idx: u32,
+}
+
+/// Short keys (up to 15 bytes) packed into two words with the length in the top byte: equal words mean
+/// equal keys. Longer keys get the marker [0, u64::MAX] and are compared by their bytes.
+#[inline]
+fn inline_key(k: &[u8]) -> [u64; 2] {
+    if k.len() <= 15 {
+        let mut b = [0u8; 16];
+        b[..k.len()].copy_from_slice(k);
+        b[15] = k.len() as u8;
+        [u64::from_le_bytes(b[0..8].try_into().unwrap()), u64::from_le_bytes(b[8..16].try_into().unwrap())]
+    } else {
+        [0, u64::MAX]
+    }
+}
+
+#[inline]
+fn mix_inline(x: [u64; 2]) -> u64 {
+    let a = x[0].wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ x[1].wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let a = (a ^ (a >> 32)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    a ^ (a >> 29)
 }
 
 /// Open-addressing table for one shard. Keys are compared in full, but only when hashes match.
@@ -443,14 +500,14 @@ struct ShardTable {
 
 impl ShardTable {
     fn new() -> Self {
-        ShardTable { slots: vec![Slot { h: 0, key: &[], local: u32::MAX }; 1024], len: 0 }
+        ShardTable { slots: vec![Slot { h: 0, inl: [0; 2], key: &[], local: u32::MAX }; 1024], len: 0 }
     }
 
     fn grow(&mut self) {
         let old = std::mem::take(&mut self.slots);
         let cap = old.len() * 2;
         let mask = cap - 1;
-        let mut slots = vec![Slot { h: 0, key: &[], local: u32::MAX }; cap];
+        let mut slots = vec![Slot { h: 0, inl: [0; 2], key: &[], local: u32::MAX }; cap];
         for sl in old.into_iter().filter(|sl| sl.local != u32::MAX) {
             let mut pos = (sl.h as usize) & mask;
             while slots[pos].local != u32::MAX {
@@ -462,7 +519,7 @@ impl ShardTable {
     }
 
     /// Local ID of `key`, assigning the next ID when it is new.
-    fn get_or_insert(&mut self, h: u64, key: Bytes) -> u32 {
+    fn get_or_insert(&mut self, h: u64, inl: [u64; 2], key: impl Fn() -> Bytes) -> u32 {
         if (self.len as usize + 1) * 2 > self.slots.len() {
             self.grow();
         }
@@ -471,11 +528,11 @@ impl ShardTable {
         loop {
             let sl = self.slots[pos];
             if sl.local == u32::MAX {
-                self.slots[pos] = Slot { h, key, local: self.len };
+                self.slots[pos] = Slot { h, inl, key: key(), local: self.len };
                 self.len += 1;
                 return self.len - 1;
             }
-            if sl.h == h && sl.key == key {
+            if sl.h == h && sl.inl == inl && (inl[1] != u64::MAX || sl.key == key()) {
                 return sl.local;
             }
             pos = (pos + 1) & mask;
@@ -495,25 +552,44 @@ impl Interner {
     }
 
     /// Intern every key. Returns (shard, local) per item, packed as shard << 32 | local.
+    /// Each worker partitions its slice of the keys by shard into records that carry the hash and the inline
+    /// key; every shard table then reads its records front to back and never touches the key bytes on a hit.
     fn intern(&mut self, keys: &[Bytes]) -> Vec<u64> {
         let rs = &self.rs;
-        let hashes: Vec<u64> = keys.par_iter().map(|k| rs.hash_one(k)).collect();
-        let shards: Vec<u8> = hashes.par_iter().map(|&h| (h >> 58) as u8).collect();
-        let buckets = bucket(&shards);
+        let workers = rayon::current_num_threads().max(1);
+        let per = keys.len().div_ceil(workers).max(1);
+        let parts: Vec<Vec<Vec<IRec>>> = (0..workers)
+            .into_par_iter()
+            .map(|w| {
+                let lo = (w * per).min(keys.len());
+                let hi = ((w + 1) * per).min(keys.len());
+                let mut buckets: Vec<Vec<IRec>> = (0..SHARDS).map(|_| Vec::with_capacity((hi - lo) / SHARDS * 9 / 8 + 16)).collect();
+                for i in lo..hi {
+                    let k = keys[i];
+                    let inl = inline_key(k);
+                    let h = if inl[1] == u64::MAX { rs.hash_one(k) } else { mix_inline(inl) };
+                    buckets[(h >> 58) as usize].push(IRec { h, inl, idx: i as u32 });
+                }
+                buckets
+            })
+            .collect();
         let results: Vec<Vec<(u32, u64)>> = self
             .maps
             .par_iter_mut()
             .enumerate()
             .map(|(s, table)| {
-                let idxs = &buckets[s];
-                let mut out = Vec::with_capacity(idxs.len());
-                for &i in idxs {
-                    let local = table.get_or_insert(hashes[i as usize], keys[i as usize]);
-                    out.push((i, ((s as u64) << 32) | local as u64));
+                let total: usize = parts.iter().map(|p| p[s].len()).sum();
+                let mut out = Vec::with_capacity(total);
+                for p in &parts {
+                    for r in &p[s] {
+                        let local = table.get_or_insert(r.h, r.inl, || keys[r.idx as usize]);
+                        out.push((r.idx, ((s as u64) << 32) | local as u64));
+                    }
                 }
                 out
             })
             .collect();
+        drop(parts);
         let mut packed = vec![0u64; keys.len()];
         let packed_ptr = SyncPtr(packed.as_mut_ptr());
         results.par_iter().for_each(|part| {
@@ -1000,15 +1076,11 @@ fn main() {
 
     // ---- identity
     let mut interner = Interner::new(rs);
-    let ev_keys: Vec<Bytes> = kept.iter().map(|&i| rows[i as usize].uid).collect();
+    let ev_keys: Vec<Bytes> = kept.par_iter().map(|&i| rows[i as usize].uid).collect();
     let ev_packed = interner.intern(&ev_keys);
-    let ck_keys: Vec<Bytes> = clicks.iter().map(|c| c.uid).collect();
+    let ck_keys: Vec<Bytes> = clicks.par_iter().map(|c| c.uid).collect();
     let ck_packed = interner.intern(&ck_keys);
-    let mut ln_keys: Vec<Bytes> = Vec::with_capacity(links.len() * 2);
-    for &(a, b) in &links {
-        ln_keys.push(a);
-        ln_keys.push(b);
-    }
+    let ln_keys: Vec<Bytes> = links.par_iter().flat_map_iter(|&(a, b)| [a, b]).collect();
     let ln_packed = interner.intern(&ln_keys);
     timer.log(&format!("interned {} user ids", interner.total()));
 
@@ -1053,8 +1125,8 @@ fn main() {
 
     // ---- events: person-sorted array
     let evs: Vec<EvS> = kept
-        .iter()
-        .zip(ev_packed.iter())
+        .par_iter()
+        .zip(ev_packed.par_iter())
         .map(|(&i, &p)| {
             let r = &rows[i as usize];
             let person = root[gid(p) as usize];
@@ -1068,8 +1140,8 @@ fn main() {
     // ---- clicks: person-sorted array, duplicates removed (identical copies share a key)
     let lo = ws - WEEK;
     let mut cls: Vec<ClS> = clicks
-        .iter()
-        .zip(ck_packed.iter())
+        .par_iter()
+        .zip(ck_packed.par_iter())
         .map(|(c, &p)| {
             let person = root[gid(p) as usize];
             ClS { key: ((person as u64) << 32) | (c.ts - lo) as u64, cid: c.cid, ts: c.ts, camp: c.camp }

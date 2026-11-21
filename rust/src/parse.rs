@@ -23,6 +23,109 @@ pub const MAX_PRICE: i64 = 10_000_000;
 /// `\r` is an ordinary byte and stays in its field.
 #[inline]
 pub fn split_fields<'a>(line: &'a [u8], n: usize, out: &mut [Option<&'a [u8]>; 8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        split_fields_sse2(line, n, out)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        split_fields_generic(line, n, out)
+    }
+}
+
+/// One-pass SSE2 splitter (SSE2 is in the x86-64 baseline, so it needs no runtime check).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn split_fields_sse2<'a>(line: &'a [u8], n: usize, out: &mut [Option<&'a [u8]>; 8]) -> bool {
+    use std::arch::x86_64::*;
+    let len = line.len();
+    let last = n - 1;
+    let mut commas = [0usize; 8];
+    let mut ncomma = 0usize;
+    let mut quotes = 0usize;
+    let mut i = 0usize;
+    if len >= 16 {
+        // SAFETY: every 16-byte load stays inside `line` (offset + 16 <= len).
+        unsafe {
+            let vc = _mm_set1_epi8(b',' as i8);
+            let vq = _mm_set1_epi8(b'"' as i8);
+            let zero = _mm_setzero_si128();
+            let p = line.as_ptr();
+            let mut qacc = zero;
+            let mut blocks = 0u32;
+            while i + 16 <= len {
+                let v = _mm_loadu_si128(p.add(i) as *const __m128i);
+                let mut mc = _mm_movemask_epi8(_mm_cmpeq_epi8(v, vc)) as u32;
+                qacc = _mm_sub_epi8(qacc, _mm_cmpeq_epi8(v, vq));
+                blocks += 1;
+                if blocks == 255 {
+                    let s = _mm_sad_epu8(qacc, zero);
+                    quotes += (_mm_cvtsi128_si64(s) as u64 + _mm_cvtsi128_si64(_mm_unpackhi_epi64(s, s)) as u64) as usize;
+                    qacc = zero;
+                    blocks = 0;
+                }
+                while mc != 0 {
+                    if ncomma == last {
+                        return false;
+                    }
+                    commas[ncomma] = i + mc.trailing_zeros() as usize;
+                    ncomma += 1;
+                    mc &= mc - 1;
+                }
+                i += 16;
+            }
+            let s = _mm_sad_epu8(qacc, zero);
+            quotes += (_mm_cvtsi128_si64(s) as u64 + _mm_cvtsi128_si64(_mm_unpackhi_epi64(s, s)) as u64) as usize;
+            if i < len {
+                // tail: one more block ending at the last byte; its first `ov` lanes were already handled
+                let off = len - 16;
+                let ov = (i - off) as u32;
+                let v = _mm_loadu_si128(p.add(off) as *const __m128i);
+                let mut mc = (_mm_movemask_epi8(_mm_cmpeq_epi8(v, vc)) as u32 >> ov) << ov;
+                let mq = (_mm_movemask_epi8(_mm_cmpeq_epi8(v, vq)) as u32 >> ov) << ov;
+                quotes += mq.count_ones() as usize;
+                while mc != 0 {
+                    if ncomma == last {
+                        return false;
+                    }
+                    commas[ncomma] = off + mc.trailing_zeros() as usize;
+                    ncomma += 1;
+                    mc &= mc - 1;
+                }
+                i = len;
+            }
+        }
+    }
+    while i < len {
+        match line[i] {
+            b',' => {
+                if ncomma == last {
+                    return false;
+                }
+                commas[ncomma] = i;
+                ncomma += 1;
+            }
+            b'"' => quotes += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if ncomma != last {
+        return false;
+    }
+    let mut wrapped = 0usize;
+    let mut start = 0usize;
+    for k in 0..n {
+        let end = if k < last { commas[k] } else { len };
+        out[k] = field(&line[start..end], quotes, &mut wrapped);
+        start = end + 1;
+    }
+    quotes == 2 * wrapped
+}
+
+#[allow(dead_code)]
+#[inline]
+fn split_fields_generic<'a>(line: &'a [u8], n: usize, out: &mut [Option<&'a [u8]>; 8]) -> bool {
     // A line is well formed when every quote belongs to a field that is wrapped in exactly one pair:
     // so the total quote count must equal 2 x (number of wrapped fields). One SIMD count per line
     // replaces a quote search inside every field.
@@ -117,11 +220,77 @@ pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// True when every lane (byte) of `w` outside `sep` holds an ASCII digit.
+#[inline(always)]
+fn lanes_digits(w: u64, sep: u64) -> bool {
+    let z = (w ^ 0x3030_3030_3030_3030) & !sep;
+    ((z & 0xF0F0_F0F0_F0F0_F0F0) | (((z & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0)) == 0
+}
+
+#[inline(always)]
+fn two(b: &[u8], i: usize) -> i64 {
+    (b[i].wrapping_sub(b'0') as i64) * 10 + b[i + 1].wrapping_sub(b'0') as i64
+}
+
+/// ISO forms F1 (20 bytes) and F2 (25 bytes). `Some(r)`: the shape matched and r is the timestamp (or None for an
+/// invalid date, time or offset). `None`: the shape did not match.
+#[inline(always)]
+fn parse_iso(s: &[u8]) -> Option<Option<i64>> {
+    let n = s.len();
+    if n != 20 && n != 25 {
+        return None;
+    }
+    let w0 = u64::from_le_bytes(s[0..8].try_into().unwrap()); // YYYY-MM-   separators in lanes 4, 7
+    let w1 = u64::from_le_bytes(s[8..16].try_into().unwrap()); // DDTHH:MM   separators in lanes 2, 5
+    let mut ok = lanes_digits(w0, (0xFFu64 << 32) | (0xFFu64 << 56)) && lanes_digits(w1, (0xFFu64 << 16) | (0xFFu64 << 40));
+    ok &= s[4] == b'-' && s[7] == b'-' && s[10] == b'T' && s[13] == b':' && s[16] == b':';
+    let off_min: i64;
+    let mut off_bad = false;
+    if n == 20 {
+        ok &= s[19] == b'Z' && s[17].wrapping_sub(b'0') <= 9 && s[18].wrapping_sub(b'0') <= 9;
+        off_min = 0;
+    } else {
+        let w2 = u64::from_le_bytes(s[17..25].try_into().unwrap()); // SS+HH:MM   separators in lanes 2, 5
+        ok &= lanes_digits(w2, (0xFFu64 << 16) | (0xFFu64 << 40));
+        ok &= (s[19] == b'+' || s[19] == b'-') && s[22] == b':';
+        let oh = two(s, 20);
+        let om = two(s, 23);
+        off_bad = oh > 23 || om > 59;
+        off_min = if s[19] == b'+' { oh * 60 + om } else { -(oh * 60 + om) };
+    }
+    if !ok {
+        return None;
+    }
+    let y = two(s, 0) * 100 + two(s, 2);
+    let (mo, day, h, mi, se) = (two(s, 5), two(s, 8), two(s, 11), two(s, 14), two(s, 17));
+    if off_bad || !(1..=12).contains(&mo) || day < 1 || day > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+        return Some(None);
+    }
+    Some(Some(((days_from_civil(y, mo, day) * 86_400 + h * 3600 + mi * 60 + se) - off_min * 60) * 1000))
+}
+
 /// Timestamp in integer milliseconds since the epoch, or `None` when bad.
 /// Forms: F3 digits only; F1 `YYYY-MM-DDTHH:MM:SSZ`; F2 with `+HH:MM` / `-HH:MM`.
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
+    }
+    if s.len() == 20 || s.len() == 25 {
+        if let Some(t) = parse_iso(s) {
+            return t;
+        }
+    } else if s.len() <= 18 {
+        // F3 fast path: digits only, no overflow possible
+        let mut acc = 0u64;
+        let mut bad = false;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            bad |= d > 9;
+            acc = acc.wrapping_mul(10).wrapping_add(d as u64);
+        }
+        if !bad {
+            return Some(acc as i64);
+        }
     }
     if all_digits(s) {
         let mut i = 0;
