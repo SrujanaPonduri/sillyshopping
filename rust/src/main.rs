@@ -651,7 +651,7 @@ fn drain_events(ctx: &Ctx, st: &mut PState, pend: &mut Vec<PendEv>) {
 
 fn parse_event_range(ctx: &Ctx, st: &mut PState, data: Bytes, start: usize, end: usize, skip: bool) {
     let mut pend: Vec<PendEv> = Vec::with_capacity(BATCH);
-    for_each_record(&data[start..end], skip, 7, |line, fields| {
+    for_each_record::<7>(&data[start..end], skip, |line, fields| {
         let eid = match fields[0] {
             Some(e) => e,
             None => return,
@@ -726,7 +726,7 @@ fn drain_clicks(ctx: &Ctx, st: &mut PState, pend: &mut Vec<PendCk>) {
 
 fn parse_click_range(ctx: &Ctx, st: &mut PState, data: Bytes, start: usize, end: usize, skip: bool) {
     let mut pend: Vec<PendCk> = Vec::with_capacity(BATCH);
-    for_each_record(&data[start..end], skip, 4, |line, fields| {
+    for_each_record::<4>(&data[start..end], skip, |line, fields| {
         let (Some(_cid), Some(uid), Some(camp), Some(ts)) = (fields[0], fields[1], fields[2], fields[3]) else {
             return;
         };
@@ -776,7 +776,7 @@ fn parse_links(tasks: &[Task]) -> Vec<(Bytes, Bytes)> {
         .par_iter()
         .map(|&(data, start, end, skip)| {
             let mut out = Vec::new();
-            for_each_record(&data[start..end], skip, 2, |_line, fields| {
+            for_each_record::<2>(&data[start..end], skip, |_line, fields| {
                 if let (Some(a), Some(b)) = (fields[0], fields[1]) {
                     out.push((a, b));
                 }

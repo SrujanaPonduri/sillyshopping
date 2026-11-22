@@ -16,6 +16,7 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | 9d04f4c | stage 3+4: compact records, per-partition pipeline, no interning | 2.52 s |
 | 33a0e2f | date cache in timestamp parser, buffer reuse in sessions step | 2.30 s |
 | fc5f899 | counting-pass grouping by person + fused AVX2 line/field scanner | 1.82 s |
+| 7432ab1 | first-field id compares, biggest-first output groups | 1.69 s |
 
 ## Sandbox experiments
 
@@ -29,7 +30,14 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | fused AVX2 line/comma/quote scanner (runtime-detected, old splitter as fallback); fuzz vs old path 0 mismatches in 400k buffers | 1M dev set 2.463G -> 2.271G instructions (-7.8%); 20M NCPU=1 user time median of 5 vs the version before the counting pass: 9.40 s -> 8.99 s (-4.4%, includes the counting-pass change), non-LTO, noisy | sandbox |
 | id comparisons (event-id dedup, click-id ties) read only the first field of the line instead of splitting the whole line | 1M dev set 2.271G -> 2.192G instructions (-3.5%) | sandbox, callgrind |
 | user-partition groups handed out biggest first from a shared queue (tail latency for whale users) | no sandbox signal on 2 cores; expected to matter only at 8 threads | estimate |
-| tried and dropped: SWAR parse of numeric timestamps (-0.7% instr, not worth the risk); insertion sort for short per-person runs (+0.3% instr) | | sandbox, callgrind |
+| tried and dropped: insertion sort for short per-person runs (+0.3% instr) | | sandbox, callgrind |
+| scanner field count as a const generic (unrolled field loop) | 1M dev set 2.1887G -> 2.1312G instructions (-2.6%) | sandbox, callgrind |
+| quote-free line fast path in the scanner (unchecked slices, no per-field quote handling) | -> 2.1195G (-0.6%) | sandbox, callgrind |
+| inline 20-byte ISO timestamp path (fixed-size array, masked separator checks), general path out of line | -> 2.0833G (-1.7%) | sandbox, callgrind |
+| numeric timestamps eight digits at a time (SWAR, overlapping tail load); unit test vs naive, 200k cases | -> 2.0562G (-1.3%) | sandbox, callgrind |
+| the four parser changes together | 2.1887G -> 2.0562G instructions (-6.1%); 20M, 2 cores, wall median of 5-6: ~3.7 s -> ~3.6 s (-2%, noisy) | sandbox |
+| gates for the parser changes: 36 fixtures, 60 random seeds vs reference, dev1/s5/s20 identical to the previous engine, files byte-identical at NCPU 1/3/8, SS_RANGE_BYTES=4096 identical, scanner fuzz 400k buffers 0 mismatches, new-vs-old parse_ts fuzz 6M strings 0 mismatches | all pass | sandbox |
+| tried and dropped: MADV_POPULATE_READ on each input range (no measurable change, 5 runs each); mallopt (mmap/trim thresholds, top pad) (no measurable change); SWAR numeric parse alone earlier (-0.7%) is now part of the bundle above | | sandbox |
 
 ## Where the time goes (sandbox, NCPU=1, 20M events, 9d04f4c, LTO)
 

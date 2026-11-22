@@ -167,23 +167,22 @@ fn field<'a>(f: &'a [u8], quotes: usize, wrapped: &mut usize) -> Option<&'a [u8]
 /// Calls `f(line, fields)` for every well-formed line of `data` that has exactly `n` fields (n <= 7), header
 /// excluded when `skip_header`. Same result as `for_each_line` followed by `split_fields`, but with AVX2 the
 /// line ends, commas and quotes are found together in one pass over 64-byte blocks.
-pub fn for_each_record<'a>(
+pub fn for_each_record<'a, const N: usize>(
     data: &'a [u8],
     skip_header: bool,
-    n: usize,
     mut f: impl FnMut(&'a [u8], &[Option<&'a [u8]>; 8]),
 ) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
             // SAFETY: the CPU supports AVX2, checked just above.
-            unsafe { scan_avx2(data, skip_header, n, &mut f) };
+            unsafe { scan_avx2::<N>(data, skip_header, &mut f) };
             return;
         }
     }
     let mut fields: [Option<&'a [u8]>; 8] = [None; 8];
     for_each_line(data, skip_header, |line| {
-        if split_fields(line, n, &mut fields) {
+        if split_fields(line, N, &mut fields) {
             f(line, &fields);
         }
     });
@@ -191,15 +190,15 @@ pub fn for_each_record<'a>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,popcnt,bmi1")]
-unsafe fn scan_avx2<'a>(
+unsafe fn scan_avx2<'a, const N: usize>(
     data: &'a [u8],
     skip_header: bool,
-    n: usize,
     f: &mut impl FnMut(&'a [u8], &[Option<&'a [u8]>; 8]),
 ) {
     use std::arch::x86_64::*;
     let len = data.len();
-    let last = n - 1;
+    let n = N;
+    let last = N - 1;
     let vc = _mm256_set1_epi8(b',' as i8);
     let vn = _mm256_set1_epi8(b'\n' as i8);
     let vq = _mm256_set1_epi8(b'"' as i8);
@@ -218,15 +217,28 @@ unsafe fn scan_avx2<'a>(
             let end: usize = $end;
             if !(skip_header && line_no == 0) && ncomma == last {
                 let line = &data[line_start..end];
-                let mut wrapped = 0usize;
-                let mut st = line_start;
-                for k in 0..n {
-                    let e = if k < last { commas[k] } else { end };
-                    fields[k] = field(&data[st..e], quotes, &mut wrapped);
-                    st = e + 1;
-                }
-                if quotes == 2 * wrapped {
+                if quotes == 0 {
+                    // No quote characters on this line: fields are the plain slices between the commas.
+                    let mut st = line_start;
+                    for k in 0..N {
+                        let e = if k < last { commas[k] } else { end };
+                        // SAFETY: commas are ascending positions inside [line_start, end) and end <= len.
+                        let sl = data.get_unchecked(st..e);
+                        fields[k] = if sl.is_empty() { None } else { Some(sl) };
+                        st = e + 1;
+                    }
                     f(line, &fields);
+                } else {
+                    let mut wrapped = 0usize;
+                    let mut st = line_start;
+                    for k in 0..n {
+                        let e = if k < last { commas[k] } else { end };
+                        fields[k] = field(&data[st..e], quotes, &mut wrapped);
+                        st = e + 1;
+                    }
+                    if quotes == 2 * wrapped {
+                        f(line, &fields);
+                    }
                 }
             }
             line_no += 1;
@@ -410,13 +422,125 @@ fn parse_iso(s: &[u8]) -> Option<Option<i64>> {
     Some(Some(((days * 86_400 + h * 3600 + mi * 60 + se) - off_min * 60) * 1000))
 }
 
+/// Fast path for the 20-byte form `YYYY-MM-DDTHH:MM:SSZ`. `Some(r)`: the shape matched and r is the timestamp (None
+/// for an invalid date or time); `None`: the shape did not match. Fixed-size access removes bounds checks.
+#[inline(always)]
+fn parse_iso20(a: &[u8; 20]) -> Option<Option<i64>> {
+    let w0 = u64::from_le_bytes(a[0..8].try_into().unwrap()); // YYYY-MM-   '-' in lanes 4, 7
+    let w1 = u64::from_le_bytes(a[8..16].try_into().unwrap()); // DDTHH:MM   'T' in lane 2, ':' in lane 5
+    let w2 = u64::from_le_bytes(a[12..20].try_into().unwrap()); // lanes: 0 H, 1 ':', 2-3 MM, 4 ':', 5-6 SS, 7 'Z'
+    const SEP0: u64 = (0xFFu64 << 32) | (0xFFu64 << 56);
+    const SEP1: u64 = (0xFFu64 << 16) | (0xFFu64 << 40);
+    const SEP2: u64 = (0xFFu64 << 8) | (0xFFu64 << 32) | (0xFFu64 << 56);
+    let shape = lanes_digits(w0, SEP0)
+        & lanes_digits(w1, SEP1)
+        & lanes_digits(w2, SEP2)
+        & ((w0 & SEP0) == (((b'-' as u64) << 32) | ((b'-' as u64) << 56)))
+        & ((w1 & SEP1) == (((b'T' as u64) << 16) | ((b':' as u64) << 40)))
+        & ((w2 & ((0xFFu64 << 32) | (0xFFu64 << 56))) == (((b':' as u64) << 32) | ((b'Z' as u64) << 56)));
+    if !shape {
+        return None;
+    }
+    let d = |i: usize| (a[i] - b'0') as i64;
+    let (h, mi, se) = (d(11) * 10 + d(12), d(14) * 10 + d(15), d(17) * 10 + d(18));
+    if h > 23 || mi > 59 || se > 59 {
+        return Some(None);
+    }
+    let d16 = u16::from_le_bytes([a[8], a[9]]) as u64;
+    let slot = ((w0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ d16.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) >> 58) as usize;
+    let cached = DATE_CACHE.with(|c| {
+        // SAFETY: the cell is thread-local and these accesses never overlap.
+        let e = unsafe { (&(*c.get()))[slot] };
+        if e.0 == w0 && e.1 == d16 {
+            Some(e.2)
+        } else {
+            None
+        }
+    });
+    let days = match cached {
+        Some(d) => d,
+        None => {
+            let y = d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3);
+            let (mo, day) = (d(5) * 10 + d(6), d(8) * 10 + d(9));
+            if !(1..=12).contains(&mo) || day < 1 || day > days_in_month(y, mo) {
+                return Some(None);
+            }
+            let dd = days_from_civil(y, mo, day);
+            // SAFETY: as above.
+            DATE_CACHE.with(|c| unsafe { (&mut (*c.get()))[slot] = (w0, d16, dd) });
+            dd
+        }
+    };
+    Some(Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000))
+}
+
 thread_local! {
     static DATE_CACHE: std::cell::UnsafeCell<[(u64, u64, i64); 64]> = const { std::cell::UnsafeCell::new([(0, 0, 0); 64]) };
 }
 
 /// Timestamp in integer milliseconds since the epoch, or `None` when bad.
 /// Forms: F3 digits only; F1 `YYYY-MM-DDTHH:MM:SSZ`; F2 with `+HH:MM` / `-HH:MM`.
+/// Eight digits held one per byte in the low nibbles (first digit in the lowest byte) as a number.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let mut v = x.wrapping_mul(2561) >> 8;
+    v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+}
+
+/// Value of up to 18 ASCII digits (eight at a time), or None when a byte is not a digit.
+#[inline(always)]
+fn digits18(s: &[u8]) -> Option<u64> {
+    const P10: [u64; 8] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+    let n = s.len();
+    if n < 8 {
+        let mut acc = 0u64;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            acc = acc * 10 + d as u64;
+        }
+        return Some(acc);
+    }
+    let mut acc = 0u64;
+    let mut i = 0usize;
+    while n - i >= 8 {
+        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        if !lanes_digits(w, 0) {
+            return None;
+        }
+        acc = acc * 100_000_000 + swar8(w & 0x0F0F_0F0F_0F0F_0F0F);
+        i += 8;
+    }
+    let r = n - i; // 0..=7 digits left: read the last eight bytes (all already known to be digits where they overlap)
+    if r > 0 {
+        let w = u64::from_le_bytes(s[n - 8..].try_into().unwrap());
+        if !lanes_digits(w, 0) {
+            return None;
+        }
+        // the r wanted digits are in the top r lanes; moving them to the top and zero-filling the rest keeps them aligned
+        let x = (w & 0x0F0F_0F0F_0F0F_0F0F) & (u64::MAX << (8 * (8 - r)));
+        acc = acc * P10[r] + swar8(x);
+    }
+    Some(acc)
+}
+
+#[inline(always)]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
+    // The common ISO form is handled inline; everything else (and a 20-byte value of another shape) takes the
+    // out-of-line general path, which gives the same answer as before for every input.
+    if let Ok(a) = <&[u8; 20]>::try_from(s) {
+        if let Some(t) = parse_iso20(a) {
+            return t;
+        }
+    }
+    parse_ts_general(s)
+}
+
+#[inline(never)]
+fn parse_ts_general(s: &[u8]) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
@@ -426,15 +550,8 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
         }
     } else if s.len() <= 18 {
         // F3 fast path: digits only, no overflow possible
-        let mut acc = 0u64;
-        let mut bad = false;
-        for &c in s {
-            let d = c.wrapping_sub(b'0');
-            bad |= d > 9;
-            acc = acc.wrapping_mul(10).wrapping_add(d as u64);
-        }
-        if !bad {
-            return Some(acc as i64);
+        if let Some(v) = digits18(s) {
+            return Some(v as i64);
         }
     }
     if all_digits(s) {
@@ -515,5 +632,36 @@ pub fn parse_price(s: &[u8]) -> Option<i64> {
         Some(v)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod digit_tests {
+    use super::*;
+    #[test]
+    fn digits18_matches_naive() {
+        let mut x = 0x1234_5678_9ABC_DEF1u64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = 1 + (x % 18) as usize;
+            let mut buf = Vec::new();
+            let mut y = x;
+            for _ in 0..len {
+                y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                buf.push(b'0' + ((y >> 33) % 10) as u8);
+            }
+            if x % 7 == 0 {
+                let k = (x >> 20) as usize % len;
+                buf[k] = b"x:- ,/"[(x >> 40) as usize % 6];
+            }
+            let naive = if buf.iter().all(u8::is_ascii_digit) {
+                Some(buf.iter().fold(0u64, |a, &c| a * 10 + (c - b'0') as u64))
+            } else {
+                None
+            };
+            assert_eq!(digits18(&buf), naive, "{:?}", std::str::from_utf8(&buf));
+        }
     }
 }
