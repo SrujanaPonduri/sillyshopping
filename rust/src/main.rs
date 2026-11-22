@@ -1243,8 +1243,45 @@ impl LocalIds {
 
 /// Everything for one person partition: its events and clicks are gathered from the workers, copies that lost
 /// dedup are dropped, and sessions, credit and assists are computed while the records sit in the cache.
-fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) {
-    let mut evs: Vec<Ev> = gather(sh.states, |s| &s.evs, p);
+/// Buffers reused from one partition to the next on the same worker, so the per-partition step does not
+/// allocate and zero fresh memory 2048 times.
+#[derive(Default)]
+struct Scratch {
+    evs: Vec<Ev>,
+    ids: Vec<u32>,
+    pers: Vec<u64>,
+    order: Vec<u32>,
+    rank: Vec<u32>,
+    start: Vec<u32>,
+    fill: Vec<u32>,
+    sorted: Vec<Ev>,
+    names: Vec<Bytes>,
+    es: Vec<EvS>,
+    cks: Vec<Ck>,
+    cstart: Vec<u32>,
+    crank: Vec<u32>,
+    cfill: Vec<u32>,
+    csorted: Vec<Ck>,
+    cls: Vec<ClS>,
+}
+
+/// `gather`, into an existing vector.
+fn gather_into<T: Copy, S>(states: &[S], sel: impl Fn(&S) -> &Scat<T>, p: usize, out: &mut Vec<T>) {
+    out.clear();
+    let total: usize = states.iter().map(|s| sel(s).parts[p].iter().map(|b| b.len()).sum::<usize>()).sum();
+    out.reserve(total);
+    for s in states {
+        for b in &sel(s).parts[p] {
+            out.extend_from_slice(b);
+        }
+    }
+}
+
+/// Everything for one person partition: its events and clicks are gathered from the workers, copies that lost
+/// dedup are dropped, and sessions, credit and assists are computed while the records sit in the cache.
+fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink, sc: &mut Scratch) {
+    let Scratch { evs, ids, pers, order, rank, start, fill, sorted, names, es, cks, cstart, crank, cfill, csorted, cls } = sc;
+    gather_into(sh.states, |s| &s.evs, p, evs);
     if evs.is_empty() {
         return;
     }
@@ -1270,34 +1307,38 @@ fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) 
     // number (first seen), order the numbers by person hash so the output does not depend on arrival order, move
     // the records to their person's run with a counting pass, then sort each short run by time.
     let mut map = LocalIds::new();
-    let mut pers: Vec<u64> = Vec::new();
-    let ids: Vec<u32> = evs.iter().map(|e| map.get_or_insert(e.person, &mut pers)).collect();
+    pers.clear();
+    ids.clear();
+    ids.extend(evs.iter().map(|e| map.get_or_insert(e.person, pers)));
     let np = pers.len();
-    let mut order: Vec<u32> = (0..np as u32).collect();
+    order.clear();
+    order.extend(0..np as u32);
     order.sort_unstable_by_key(|&i| pers[i as usize]);
-    let mut rank = vec![0u32; np];
+    rank.clear();
+    rank.resize(np, 0);
     for (r, &i) in order.iter().enumerate() {
         rank[i as usize] = r as u32;
     }
-    let mut start = vec![0u32; np + 1];
-    for &id in &ids {
+    start.clear();
+    start.resize(np + 1, 0);
+    for &id in ids.iter() {
         start[rank[id as usize] as usize + 1] += 1;
     }
     for r in 0..np {
         start[r + 1] += start[r];
     }
-    let mut fill: Vec<u32> = start[..np].to_vec();
-    let mut sorted: Vec<Ev> = vec![evs[0]; evs.len()];
-    for (e, &id) in evs.iter().zip(&ids) {
+    fill.clear();
+    fill.extend_from_slice(&start[..np]);
+    sorted.clear();
+    sorted.resize(evs.len(), evs[0]);
+    for (e, &id) in evs.iter().zip(ids.iter()) {
         let r = rank[id as usize] as usize;
         sorted[fill[r] as usize] = *e;
         fill[r] += 1;
     }
-    drop(evs);
-    drop(ids);
 
-    let mut names: Vec<Bytes> = Vec::with_capacity(np);
-    let mut es: Vec<EvS> = Vec::with_capacity(sorted.len());
+    names.clear();
+    es.clear();
     for r in 0..np {
         let run = &mut sorted[start[r] as usize..start[r + 1] as usize];
         if run.len() > 1 {
@@ -1315,30 +1356,31 @@ fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) 
             });
         }
     }
-    drop(sorted);
 
     // clicks of persons that have events here, grouped the same way; identical copies removed, ties in click-id order
-    let cks: Vec<Ck> = gather(sh.states, |s| &s.cks, p);
-    let mut cstart = vec![0u32; np + 1];
-    let crank: Vec<u32> = cks
-        .iter()
-        .map(|c| match map.find(c.person) {
-            Some(id) => {
-                let r = rank[id as usize];
-                cstart[r as usize + 1] += 1;
-                r
-            }
-            None => u32::MAX,
-        })
-        .collect();
+    gather_into(sh.states, |s| &s.cks, p, cks);
+    cstart.clear();
+    cstart.resize(np + 1, 0);
+    crank.clear();
+    crank.extend(cks.iter().map(|c| match map.find(c.person) {
+        Some(id) => {
+            let r = rank[id as usize];
+            cstart[r as usize + 1] += 1;
+            r
+        }
+        None => u32::MAX,
+    }));
     for r in 0..np {
         cstart[r + 1] += cstart[r];
     }
-    let mut cls: Vec<ClS> = Vec::with_capacity(cstart[np] as usize);
+    cls.clear();
     if cstart[np] > 0 {
-        let mut cfill: Vec<u32> = cstart[..np].to_vec();
-        let mut csorted: Vec<Ck> = vec![cks[0]; cstart[np] as usize];
-        for (c, &r) in cks.iter().zip(&crank) {
+        cls.reserve(cstart[np] as usize);
+        cfill.clear();
+        cfill.extend_from_slice(&cstart[..np]);
+        csorted.clear();
+        csorted.resize(cstart[np] as usize, cks[0]);
+        for (c, &r) in cks.iter().zip(crank.iter()) {
             if r != u32::MAX {
                 csorted[cfill[r as usize] as usize] = *c;
                 cfill[r as usize] += 1;
@@ -1369,10 +1411,9 @@ fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) 
             }
         }
     }
-    drop(cks);
 
-    let users = process_chunk(sh.dims, &es, &cls, tot);
-    sink.append(&users, &names, sh.cat_names, sh.dims);
+    let users = process_chunk(sh.dims, es, cls, tot);
+    sink.append(&users, names, sh.cat_names, sh.dims);
 }
 
 // ----------------------------------------------------------------- main
@@ -1476,8 +1517,9 @@ fn main() {
             }
             let f = order[k].1;
             let mut sink = UserSink::new();
+            let mut scratch = Scratch::default();
             for p in f * PARTS_PER_FILE..(f + 1) * PARTS_PER_FILE {
-                process_partition(&sh, p, &mut tot, &mut sink);
+                process_partition(&sh, p, &mut tot, &mut sink, &mut scratch);
             }
             if f > 0 && sink.rows() == 0 {
                 continue;
