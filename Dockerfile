@@ -19,5 +19,7 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu
 FROM scratch
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /app/shopping-sessions
 WORKDIR /app
+# Ask glibc malloc for transparent huge pages: far fewer page faults on the program's large buffers.
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000:1000
 CMD ["/app/shopping-sessions"]
