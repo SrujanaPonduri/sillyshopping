@@ -240,12 +240,12 @@ struct Ev {
     price: u32,
 }
 
-/// One event line's part in dedup. `lp` holds the line address (48 bits) and the person partition
+/// One event line's part in dedup. The line's `ingest_ts` is not kept here: it is read back from the line for the few
+/// ids that occur more than once. `lp` holds the line address (48 bits) and the person partition
 /// of its record (bits 48..64, NO_PART when the event was invalid and has no record).
 #[derive(Clone, Copy)]
 struct Tag {
     eh: u64,
-    ing: i64, // BAD when unparsable
     lp: u64,
 }
 
@@ -371,6 +371,20 @@ fn line_field(lp: u64, n: usize, idx: usize) -> Bytes {
     let mut f: [Option<Bytes>; 8] = [None; 8];
     split_fields(line_from(lp), n, &mut f);
     f[idx].unwrap_or(&[])
+}
+
+/// `ingest_ts` (the fourth field) of an event line that was accepted when it was parsed; BAD when empty or unparsable.
+fn ingest_of(lp: u64) -> i64 {
+    let mut f = line_from(lp);
+    for _ in 0..3 {
+        match memchr(b',', f) {
+            Some(i) => f = &f[i + 1..],
+            None => return BAD,
+        }
+    }
+    let f = &f[..memchr(b',', f).unwrap_or(f.len())];
+    let f = if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' { &f[1..f.len() - 1] } else { f };
+    parse_ts(f).unwrap_or(BAD)
 }
 
 // ----------------------------------------------------------------- links: person of every linked ID
@@ -652,7 +666,6 @@ const BATCH: usize = 32;
 #[derive(Clone, Copy)]
 struct PendEv {
     eh: u64,
-    ing: i64,
     lp: u64, // line address | category << 48
     uh: u64, // hash of the user ID; 0 with ok == false
     ts: u32,
@@ -672,7 +685,7 @@ fn drain_events(ctx: &Ctx, st: &mut PState, pend: &mut Vec<PendEv>) {
             part = p as u64;
             st.evs.push(p, Ev { person, lp: e.lp | if linked { LINKED } else { 0 }, ts: e.ts, price: e.price });
         }
-        st.tags.push((e.eh >> (64 - NE_BITS)) as usize, Tag { eh: e.eh, ing: e.ing, lp: (e.lp & PTR_MASK) | (part << 48) });
+        st.tags.push((e.eh >> (64 - NE_BITS)) as usize, Tag { eh: e.eh, lp: (e.lp & PTR_MASK) | (part << 48) });
     }
 }
 
@@ -721,7 +734,6 @@ fn parse_event_range(ctx: &Ctx, st: &mut PState, data: Bytes, start: usize, end:
         }
         pend.push(PendEv {
             eh: hash_id(&ctx.rs, eid),
-            ing,
             lp: lp | ((cat as u64) << 48),
             uh,
             ts: if ok { (ts - ctx.ws) as u32 } else { 0 },
@@ -842,7 +854,7 @@ fn dedup_partition(tags: &[Tag], kills: &mut Vec<u64>) {
             }
             let c = &tags[s as usize];
             if c.eh == t.eh && first_field(c.lp) == first_field(t.lp) {
-                let loser = if ing_key(t.ing) < ing_key(c.ing) {
+                let loser = if ing_key(ingest_of(t.lp)) < ing_key(ingest_of(c.lp)) {
                     slots[pos] = i as u32;
                     c
                 } else {
