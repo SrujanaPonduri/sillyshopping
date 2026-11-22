@@ -350,6 +350,22 @@ fn line_from(lp: u64) -> Bytes {
     }
 }
 
+/// The first field of a line that was accepted when it was parsed: everything up to the first comma, minus one
+/// pair of wrapping quotes. Cheaper than splitting the whole line; used for event and click ids.
+fn first_field(lp: u64) -> Bytes {
+    let p = (lp & PTR_MASK) as usize;
+    let files = FILES.get().expect("files registered");
+    let i = files.partition_point(|f| f.0 <= p) - 1;
+    // SAFETY: as in line_from.
+    let rest: Bytes = unsafe { std::slice::from_raw_parts(p as *const u8, files[i].1 - p) };
+    let f = &rest[..memchr(b',', rest).unwrap_or(rest.len())];
+    if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+        &f[1..f.len() - 1]
+    } else {
+        f
+    }
+}
+
 /// Field `idx` of a line that was split successfully when it was parsed (`n` fields); empty when null.
 fn line_field(lp: u64, n: usize, idx: usize) -> Bytes {
     let mut f: [Option<Bytes>; 8] = [None; 8];
@@ -798,7 +814,7 @@ fn dedup_partition(tags: &[Tag], kills: &mut Vec<u64>) {
                 break;
             }
             let c = &tags[s as usize];
-            if c.eh == t.eh && line_field(c.lp, 7, 0) == line_field(t.lp, 7, 0) {
+            if c.eh == t.eh && first_field(c.lp) == first_field(t.lp) {
                 let loser = if ing_key(t.ing) < ing_key(c.ing) {
                     slots[pos] = i as u32;
                     c
@@ -1341,10 +1357,10 @@ fn process_partition(sh: &Shared, p: usize, tot: &mut Acc, sink: &mut UserSink) 
                     b += 1;
                 }
                 if b - a > 1 {
-                    run[a..b].sort_unstable_by(|x, y| line_field(x.lp, 4, 0).cmp(line_field(y.lp, 4, 0)));
+                    run[a..b].sort_unstable_by(|x, y| first_field(x.lp).cmp(first_field(y.lp)));
                 }
                 for k in a..b {
-                    if k > a && line_field(run[k].lp, 4, 0) == line_field(run[k - 1].lp, 4, 0) {
+                    if k > a && first_field(run[k].lp) == first_field(run[k - 1].lp) {
                         continue;
                     }
                     cls.push(ClS { key: ((r as u64) << 32) | run[k].ts as u64, ts: run[k].ts as i64 + lo, camp: run[k].camp });
@@ -1436,21 +1452,45 @@ fn main() {
         })
         .collect();
     let n_files = NP / PARTS_PER_FILE;
-    (0..n_files)
-        .into_par_iter()
-        .try_for_each(|f| -> Result<(), String> {
-            let tid = rayon::current_thread_index().unwrap_or(0);
-            let mut tot = accs[tid].lock().unwrap();
+    // Biggest groups first, handed out one at a time: the few huge users' partitions start early instead of
+    // being the last thing a worker picks up.
+    let weight = |f: usize| -> usize {
+        (f * PARTS_PER_FILE..(f + 1) * PARTS_PER_FILE)
+            .map(|p| {
+                states.iter().map(|s| s.evs.parts[p].iter().map(|b| b.len()).sum::<usize>()).sum::<usize>()
+                    + states.iter().map(|s| s.cks.parts[p].iter().map(|b| b.len()).sum::<usize>()).sum::<usize>()
+            })
+            .sum()
+    };
+    let mut order: Vec<(usize, usize)> = (0..n_files).map(|f| (weight(f), f)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+    (0..rayon::current_num_threads().max(1)).into_par_iter().for_each(|_| {
+        let tid = rayon::current_thread_index().unwrap_or(0);
+        let mut tot = accs[tid].lock().unwrap();
+        loop {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            if k >= order.len() {
+                break;
+            }
+            let f = order[k].1;
             let mut sink = UserSink::new();
             for p in f * PARTS_PER_FILE..(f + 1) * PARTS_PER_FILE {
                 process_partition(&sh, p, &mut tot, &mut sink);
             }
             if f > 0 && sink.rows() == 0 {
-                return Ok(());
+                continue;
             }
-            sink.write(&out_dir.join("user_daily").join(format!("part-{f}.parquet")))
-        })
-        .expect("write user_daily");
+            if let Err(e) = sink.write(&out_dir.join("user_daily").join(format!("part-{f}.parquet"))) {
+                *failure.lock().unwrap() = Some(e);
+                break;
+            }
+        }
+    });
+    if let Some(e) = failure.into_inner().unwrap() {
+        panic!("write user_daily: {e}");
+    }
     timer.log("sessions, credit, assists and user_daily done");
 
     let mut credited = vec![[0i64; 3]; (dims.ncamp + 1) * nd];

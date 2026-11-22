@@ -15,6 +15,7 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | b97e7e0 | parallel identity + merge | 2.70 s |
 | 9d04f4c | stage 3+4: compact records, per-partition pipeline, no interning | 2.52 s |
 | 33a0e2f | date cache in timestamp parser, buffer reuse in sessions step | 2.30 s |
+| fc5f899 | counting-pass grouping by person + fused AVX2 line/field scanner | 1.82 s |
 
 ## Sandbox experiments
 
@@ -26,6 +27,9 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 
 | per-partition grouping: counting pass by person + short per-person sorts instead of a comparison sort over the partition | 1M dev set 2.550G -> 2.463G instructions (-3.4%); 20M NCPU=1 user time median of 5: 8.85 s -> 8.49 s (-4%), non-LTO, noisy | sandbox |
 | fused AVX2 line/comma/quote scanner (runtime-detected, old splitter as fallback); fuzz vs old path 0 mismatches in 400k buffers | 1M dev set 2.463G -> 2.271G instructions (-7.8%); 20M NCPU=1 user time median of 5 vs the version before the counting pass: 9.40 s -> 8.99 s (-4.4%, includes the counting-pass change), non-LTO, noisy | sandbox |
+| id comparisons (event-id dedup, click-id ties) read only the first field of the line instead of splitting the whole line | 1M dev set 2.271G -> 2.192G instructions (-3.5%) | sandbox, callgrind |
+| user-partition groups handed out biggest first from a shared queue (tail latency for whale users) | no sandbox signal on 2 cores; expected to matter only at 8 threads | estimate |
+| tried and dropped: SWAR parse of numeric timestamps (-0.7% instr, not worth the risk); insertion sort for short per-person runs (+0.3% instr) | | sandbox, callgrind |
 
 ## Where the time goes (sandbox, NCPU=1, 20M events, 9d04f4c, LTO)
 
