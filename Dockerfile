@@ -12,13 +12,12 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
-RUN cargo build --release --locked
+# Static glibc binary: no dynamic loader or shared libraries to map at start-up, so the runtime image can be empty.
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+RUN cargo build --release --locked --target x86_64-unknown-linux-gnu
 
-FROM debian:bookworm-slim
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-COPY --from=build /src/target/release/shopping-sessions /app/shopping-sessions
-ENV PYTHONDONTWRITEBYTECODE=1
-# Diagnostic run: glibc huge-page setting removed to measure its effect on the scorer.
+FROM scratch
+COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /app/shopping-sessions
 WORKDIR /app
 USER 1000:1000
 CMD ["/app/shopping-sessions"]
