@@ -37,6 +37,9 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 | numeric timestamps eight digits at a time (SWAR, overlapping tail load); unit test vs naive, 200k cases | -> 2.0562G (-1.3%) | sandbox, callgrind |
 | the four parser changes together | 2.1887G -> 2.0562G instructions (-6.1%); 20M, 2 cores, wall median of 5-6: ~3.7 s -> ~3.6 s (-2%, noisy) | sandbox |
 | gates for the parser changes: 36 fixtures, 60 random seeds vs reference, dev1/s5/s20 identical to the previous engine, files byte-identical at NCPU 1/3/8, SS_RANGE_BYTES=4096 identical, scanner fuzz 400k buffers 0 mismatches, new-vs-old parse_ts fuzz 6M strings 0 mismatches | all pass | sandbox |
+| per-worker reusable buffers in the per-partition step (no fresh allocation per partition) | 20M, 2 cores, user+sys CPU time median of 5: 6.64 s -> 6.34 s (-4.5%, noisy); instructions +0.5% (1M dev set); page faults unchanged; outputs identical to the previous engine on dev1/s5/s20; 36 fixtures, 40 seeds pass | sandbox |
+| tried and dropped: parse the ingest time from the event time when they share the first 17 bytes (exact, fuzzed 8M cases 0 mismatches) | 2.0562G -> 2.0695G instructions (+0.6%): the inline ISO path with the date cache is already cheap | sandbox, callgrind |
+| tried and dropped: prefetch the first line of persons a few ahead before reading their names | no change in CPU time (median of 6: 7.25 s vs 7.32 s); skipping the name read entirely saved only ~2.7% (upper bound, noisy) | sandbox |
 | tried and dropped: MADV_POPULATE_READ on each input range (no measurable change, 5 runs each); mallopt (mmap/trim thresholds, top pad) (no measurable change); SWAR numeric parse alone earlier (-0.7%) is now part of the bundle above | | sandbox |
 
 ## Where the time goes (sandbox, NCPU=1, 20M events, 9d04f4c, LTO)
