@@ -18,9 +18,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /src/target/release/shopping-sessions /app/shopping-sessions
 ENV PYTHONDONTWRITEBYTECODE=1
-# Ask glibc malloc for transparent huge pages: far fewer page faults on the program's large buffers.
-# Harmless where the host has transparent huge pages off.
-ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+# Diagnostic run: glibc huge-page setting removed to measure its effect on the scorer.
 WORKDIR /app
 USER 1000:1000
 CMD ["/app/shopping-sessions"]
