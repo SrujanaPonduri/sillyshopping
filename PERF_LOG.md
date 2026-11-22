@@ -58,3 +58,10 @@ Instruction profile (1M dev set): split_fields ~15%, parse_ts ~12%, rest flat.
 | tried and dropped: bulk-mask line scanner | -0.6% instructions |
 | tried and dropped: half-hour-bin ordering instead of the per-person sort | +0.3% instructions (the sort is about 3% for events, the two counting passes cost as much) |
 | profile note: callgrind's inclusive column counts recursive calls repeatedly (the sort looked like 7% and is about 3%) | |
+
+## Smaller dedup tag (2026-11-22)
+
+| change | measured |
+| --- | --- |
+| scorer, same session: hugetlb on a static scratch image (6803a20) 1.61 s; same code without it (fast-hash, a2bf877) 1.68 s | the same code in a Debian image scored 1.64 and 1.71/1.72 in different sessions, so session noise is about 0.08 s |
+| dedup `Tag` 24 -> 16 bytes: the ingest time is no longer stored, it is read back from the line (`ingest_of`) for ids that occur more than once | dev-set instructions 2.0305G -> 2.0791G (+2.4%, the re-reads); s20 sandbox wall median 4.39 -> 4.31 s, CPU unchanged. Fixtures 36/36, 60/60 reference seeds, output identical to fast-hash on dev1/s5/s20/odd-ID set at 1, 3, 8 CPUs and with SS_RANGE_BYTES=4096. The saved memory traffic may help on the 8-core scorer; not measurable in the 2-core sandbox. |
