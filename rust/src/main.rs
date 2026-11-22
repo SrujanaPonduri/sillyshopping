@@ -375,6 +375,33 @@ fn line_field(lp: u64, n: usize, idx: usize) -> Bytes {
 
 // ----------------------------------------------------------------- links: person of every linked ID
 
+/// 64-bit hash of an ID. IDs of up to 16 bytes take a short path: the first and the last 8 bytes (overlapping for
+/// shorter IDs) go through one folded 128-bit multiply, which covers every byte. Longer IDs use the general hasher.
+/// Equal hashes are always confirmed on the ID bytes where it matters, so this only needs to spread well.
+#[inline(always)]
+fn hash_id(rs: &RandomState, b: &[u8]) -> u64 {
+    let n = b.len();
+    let (x, y) = if n >= 8 {
+        if n > 16 {
+            return rs.hash_one(b);
+        }
+        (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[n - 8..].try_into().unwrap()))
+    } else if n >= 4 {
+        (
+            u32::from_le_bytes(b[..4].try_into().unwrap()) as u64,
+            u32::from_le_bytes(b[n - 4..].try_into().unwrap()) as u64,
+        )
+    } else if n > 0 {
+        (((b[0] as u64) << 16) | ((b[n >> 1] as u64) << 8) | b[n - 1] as u64, 0)
+    } else {
+        (0, 0)
+    };
+    let m = ((x ^ 0xA076_1D64_78BD_642F ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u128).wrapping_mul((y ^ 0xE703_7ED1_A0B4_28DB) as u128);
+    let h = (m as u64) ^ ((m >> 64) as u64);
+    let m2 = ((h ^ 0x8EBC_6AF0_9C88_C6E3) as u128).wrapping_mul(0x5899_65CC_7537_4CC3u128);
+    (m2 as u64) ^ ((m2 >> 64) as u64)
+}
+
 /// Open-addressing table keyed by a 64-bit hash (0 is reserved), positioned by the high bits.
 struct HashMap64 {
     slots: Vec<[u64; 2]>,
@@ -494,7 +521,7 @@ fn build_links(rs: &RandomState, pairs: Vec<(Bytes, Bytes)>) -> Links {
             p.1
         }
     };
-    let hs: Vec<u64> = (0..n_end).into_par_iter().map(|e| norm(rs.hash_one(end(e)))).collect();
+    let hs: Vec<u64> = (0..n_end).into_par_iter().map(|e| norm(hash_id(rs, end(e)))).collect();
     // Concurrent table of distinct IDs: the slot index is the ID's number for the union-find.
     let cap = (n_end * 3 / 2).max(16);
     let keys: Vec<AtomicU64> = (0..cap).into_par_iter().map(|_| AtomicU64::new(0)).collect();
@@ -543,7 +570,7 @@ fn build_links(rs: &RandomState, pairs: Vec<(Bytes, Bytes)>) -> Links {
         .into_par_iter()
         .map(|s| {
             if keys[s].load(Ordering::Relaxed) != 0 && parent[s].load(Ordering::Relaxed) == s as u32 {
-                rs.hash_one(end(best[s].load(Ordering::Relaxed) as usize))
+                hash_id(rs, end(best[s].load(Ordering::Relaxed) as usize))
             } else {
                 0
             }
@@ -688,12 +715,12 @@ fn parse_event_range(ctx: &Ctx, st: &mut PState, data: Bytes, start: usize, end:
             && price_ok;
         let lp = line.as_ptr() as u64;
         debug_assert!(lp <= PTR_MASK);
-        let uh = if ok { ctx.rs.hash_one(uid) } else { 0 };
+        let uh = if ok { hash_id(&ctx.rs, uid) } else { 0 };
         if ok {
             ctx.links.map.prefetch(uh);
         }
         pend.push(PendEv {
-            eh: ctx.rs.hash_one(eid),
+            eh: hash_id(&ctx.rs, eid),
             ing,
             lp: lp | ((cat as u64) << 48),
             uh,
@@ -735,7 +762,7 @@ fn parse_click_range(ctx: &Ctx, st: &mut PState, data: Bytes, start: usize, end:
         if ts < ctx.lo || ts >= ctx.we {
             return;
         }
-        let uh = ctx.rs.hash_one(uid);
+        let uh = hash_id(&ctx.rs, uid);
         ctx.links.map.prefetch(uh);
         pend.push(PendCk { uh, lp: line.as_ptr() as u64, ts: (ts - ctx.lo) as u32, camp });
         if pend.len() == BATCH {

@@ -46,3 +46,15 @@ Scorer numbers are not used to pick commits; same-session A/B is.
 
 links 0.5 CPU-s, parse into partitions 7.7, dedup 1.0, sessions + user_daily write 2.5; total 11.9 CPU-s.
 Instruction profile (1M dev set): split_fields ~15%, parse_ts ~12%, rest flat.
+
+## Short-ID hash, scratch image, and ideas measured and dropped (2026-11-22)
+
+| change | measured |
+| --- | --- |
+| scorer: static binary in an empty `FROM scratch` image (b1d22b8) | 1.68 s (same code in a Debian image: 1.71, 1.72; glibc hugetlb on/off made no difference there) |
+| `hash_id`: one folded 128-bit multiply on the first and last 8 bytes for IDs up to 16 bytes, ahash above that | dev-set instructions 2.0505G -> 2.0305G (-1.0%); s20 sandbox wall median 4.38 -> 4.26 s, CPU 8.38 -> 8.12 s (2 cores, 10 interleaved runs, noisy) |
+| a first version mixed the length into the low bits and made `e1` and `e10` collide; the random differential check against the reference caught it (0/60 seeds), the fixtures did not. Fixed by mixing the length times an odd constant. | 0 collisions over 4.2M IDs of length 1-16 in a model test |
+| tried and dropped: exact 64-bit packed ID keys (6-bit codes, bijective mix, hashed fallback) | correct, but +6% instructions (2.18G) and no clear time gain |
+| tried and dropped: bulk-mask line scanner | -0.6% instructions |
+| tried and dropped: half-hour-bin ordering instead of the per-person sort | +0.3% instructions (the sort is about 3% for events, the two counting passes cost as much) |
+| profile note: callgrind's inclusive column counts recursive calls repeatedly (the sort looked like 7% and is about 3%) | |
